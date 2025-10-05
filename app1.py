@@ -11,11 +11,8 @@ import heapq
 # AI and ML Imports
 import google.generativeai as genai
 from google.generativeai.types import GenerationConfig, HarmCategory, HarmBlockThreshold
-from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import DBSCAN
-from tensorflow.keras.models import Sequential
-from tensorflow.keras.layers import LSTM, Dense, Dropout
-from tensorflow.keras import backend as K
 
 # Visualization Imports
 from streamlit_folium import st_folium
@@ -31,13 +28,14 @@ st.set_page_config(
 )
 
 # --- SECRETS MANAGEMENT ---
+# Attempt to get secrets. If they are not found, display an error and instructions.
 try:
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
     AQI_API_KEY = st.secrets["AQI_API_KEY"]
     genai.configure(api_key=GEMINI_API_KEY)
 except (FileNotFoundError, KeyError):
     st.error("🚨 API Keys not found! Please configure your Streamlit secrets.")
-    st.info("Create a file at `.streamlit/secrets.toml` with your GEMINI_API_KEY and AQI_API_KEY to run locally.")
+    st.info("To run this app, create a file at `.streamlit/secrets.toml` with your API keys.")
     st.code("""
 # .streamlit/secrets.toml
 GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE"
@@ -48,6 +46,7 @@ AQI_API_KEY = "YOUR_AQI_API_KEY_HERE"
 
 # --- 2. SHARED DATA & CONSTANTS ---
 
+# Base data for Hyderabad zones
 HYDERABAD_ZONES_BASE = [
     {'id': 1, 'name': 'Banjara Hills', 'type': 'Posh Residential', 'lat': 17.414, 'lon': 78.435},
     {'id': 2, 'name': 'Gachibowli', 'type': 'Financial District', 'lat': 17.44, 'lon': 78.34},
@@ -63,12 +62,14 @@ HYDERABAD_ZONES_BASE = [
     {'id': 12, 'name': 'Kukatpally', 'type': 'Dense Residential', 'lat': 17.485, 'lon': 78.4},
 ]
 
+# Defines connections between zones for routing
 ZONE_GRAPH = {
   1: [10, 11, 7], 2: [5, 12], 3: [12], 4: [6], 5: [2, 12, 10],
   6: [4, 9, 8, 11], 7: [1, 10], 8: [6], 9: [6, 11],
   10: [1, 5, 7, 11], 11: [1, 9, 10, 6], 12: [2, 3, 5],
 }
 
+# Default map coordinates and baseline station location
 DEFAULT_LAT, DEFAULT_LON = 17.43, 78.45
 BASELINE_STATION_LAT, BASELINE_STATION_LON = 17.4557, 78.4280
 
@@ -76,6 +77,7 @@ BASELINE_STATION_LAT, BASELINE_STATION_LON = 17.4557, 78.4280
 
 @st.cache_data
 def get_realistic_hyderabad_zones(baseline_aqi, baseline_temp):
+    """Generates simulated environmental data for zones based on their type."""
     offsets = {
         'Industrial': {'temp': +4, 'aqi': +50}, 'Dense Residential': {'temp': +3, 'aqi': +20},
         'Commercial Hub': {'temp': +3, 'aqi': +30}, 'Historic/Market': {'temp': +2, 'aqi': +40},
@@ -97,6 +99,7 @@ def get_realistic_hyderabad_zones(baseline_aqi, baseline_temp):
     return pd.DataFrame(zones)
 
 def run_dqn_simulation():
+    """Simulates identifying critical hotspots based on temperature and AQI thresholds."""
     st.session_state.logs.append("DQN: Identifying hotspots...")
     zones_df = st.session_state.zones.copy()
     zones_df['needs_intervention'] = (zones_df['temperature'] > 40) & (zones_df['aqi'] > 100)
@@ -104,6 +107,7 @@ def run_dqn_simulation():
     st.session_state.logs.append(f"DQN Complete: {zones_df['needs_intervention'].sum()} critical zones found.")
 
 def run_ddpg_simulation():
+    """Simulates calculating the required intensity for mitigation actions."""
     st.session_state.logs.append("DDPG: Calculating mitigation intensity...")
     zones_df = st.session_state.zones.copy()
     for i, row in zones_df.iterrows():
@@ -113,6 +117,7 @@ def run_ddpg_simulation():
     st.session_state.logs.append("DDPG Complete: Intensities assigned.")
 
 def run_gemini_suggestions():
+    """Contacts Gemini API to get mitigation suggestions for critical zones."""
     st.session_state.logs.append("Contacting Gemini API...")
     hotspots = st.session_state.zones[st.session_state.zones['needs_intervention']]
     if hotspots.empty:
@@ -120,9 +125,8 @@ def run_gemini_suggestions():
         return
 
     model = genai.GenerativeModel('gemini-2.5-flash')
-    details = "\n".join([f'- Zone ID: {z["id"]}, Name: "{z["name"]}" ({z["type"]}), Temp: {z["temperature"]}°C, AQI: {z["aqi"]}, Intensity: {z["mitigation_intensity"]:.2f}' for _, z in hotspots.iterrows()])
+    details = "\n".join([f'- Zone ID: {z["id"]}, Name: "{z["name"]}" ({z["type"]}), Temp: {z["temperature"]:.1f}°C, AQI: {z["aqi"]}, Intensity: {z["mitigation_intensity"]:.2f}' for _, z in hotspots.iterrows()])
     
-    # CRITICAL FIX 2: Updated prompt to prevent JSON parsing errors.
     prompt = f"""You are an expert urban planning AI for Hyderabad, India. You specialize in creative, practical, and culturally relevant strategies for heat and pollution mitigation. For each of the "Critical Zones" listed below, provide a tailored cooling and air quality improvement strategy.
 
 Your response MUST be a single, valid JSON object with one key: "suggestions". This key should contain a list of objects, where each object has three keys: "zoneId" (integer), "detailed_suggestion" (a multi-line string with markdown bullet points), and "image_prompt" (a descriptive prompt for an AI image generator).
@@ -131,27 +135,18 @@ IMPORTANT: Within the "detailed_suggestion" JSON string value, you MUST use the 
 
 Critical Zones:
 {details}
-
-Example of a valid "detailed_suggestion" value: "- Install large, shaded cooling zones with misting fans in market areas.\\n- Implement a 'cool-roof' program for vendors, using reflective paint.\\n- Organize evening 'low-traffic' hours to reduce daytime congestion and pollution."
-
-Full Example Response Format:
-{{
-  "suggestions": [
-    {{
-      "zoneId": 4,
-      "detailed_suggestion": "This is the first line.\\nThis is the second line with bullet points:\\n- Point 1\\n- Point 2",
-      "image_prompt": "A bustling, vibrant Charminar market area..."
-    }}
-  ]
-}}"""
+"""
 
     try:
+        generation_config = GenerationConfig(response_mime_type="application/json")
         safety_settings = [{"category": c, "threshold": HarmBlockThreshold.BLOCK_NONE} for c in HarmCategory if c != HarmCategory.HARM_CATEGORY_UNSPECIFIED]
+        
         response = model.generate_content(
             prompt,
-            generation_config=GenerationConfig(response_mime_type="application/json"),
+            generation_config=generation_config,
             safety_settings=safety_settings
         )
+        
         suggestions = json.loads(response.text).get("suggestions", [])
         if not suggestions:
             st.session_state.error = "AI returned no suggestions. The model may be temporarily unavailable."
@@ -159,18 +154,24 @@ Full Example Response Format:
 
         zones_df = st.session_state.zones.copy()
         for s in suggestions:
-            zones_df.loc[zones_df['id'] == s['zoneId'], 'suggestion'] = s['detailed_suggestion']
-            image_prompt = s.get('image_prompt', 'abstract cityscape')
-            seed = hashlib.md5(image_prompt.encode()).hexdigest()
-            zones_df.loc[zones_df['id'] == s['zoneId'], 'image_url'] = f"https://picsum.photos/seed/{seed}/400/300"
+            zone_id = s.get('zoneId')
+            if zone_id is not None:
+                suggestion_text = s.get('detailed_suggestion', '').replace('\\n', '<br>')
+                zones_df.loc[zones_df['id'] == zone_id, 'suggestion'] = suggestion_text
+                
+                image_prompt = s.get('image_prompt', 'abstract cityscape')
+                seed = hashlib.md5(image_prompt.encode()).hexdigest()
+                zones_df.loc[zones_df['id'] == zone_id, 'image_url'] = f"https://picsum.photos/seed/{seed}/400/300"
+                
         st.session_state.zones = zones_df
         st.session_state.logs.append(f"Gemini Complete: Parsed {len(suggestions)} mitigation strategies.")
     except Exception as e:
         st.session_state.error = f"Failed to get or parse AI response: {e}"
         st.session_state.logs.append(f"Gemini Error: {e}")
 
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=3600) # Cache API calls for 1 hour
 def fetch_aqi_from_api(lat, lon):
+    """Fetches live AQI data from the World Air Quality Index project."""
     url = f"https://api.waqi.info/feed/geo:{lat};{lon}/?token={AQI_API_KEY}"
     try:
         response = requests.get(url, timeout=10)
@@ -180,154 +181,57 @@ def fetch_aqi_from_api(lat, lon):
             aqi = data["data"].get("aqi", np.nan)
             pm25 = data["data"]["iaqi"].get("pm25", {}).get("v", np.nan)
             pm10 = data["data"]["iaqi"].get("pm10", {}).get("v", np.nan)
-            if np.isnan(pm10) and not np.isnan(pm25):
-                pm10 = round(pm25 * 1.5 + np.random.uniform(-5, 5), 1)
             return aqi, pm25, pm10
     except requests.exceptions.RequestException as e:
         st.warning(f"Could not fetch live AQI data: {e}")
     return np.nan, np.nan, np.nan
 
 def generate_past_aqi(latest_aqi, hours=168):
+    """Generates a week of simulated historical AQI data for forecasting."""
     base = latest_aqi if latest_aqi and not np.isnan(latest_aqi) else 75
     past = [max(10, base + 15 * np.sin(2*np.pi*(i%24)/24) + np.random.normal(0, 5)) for i in range(hours)]
     times = [(datetime.now() - timedelta(hours=hours - i)) for i in range(hours)]
     return times, past
 
-# CRITICAL FIX 1: Removed @st.cache_data from this function to prevent Keras session conflicts.
-# def lstm_multi_step_forecast(aqi_values_tuple, steps):
-#     """Trains an LSTM model and returns a forecast. Do not cache this function."""
-#     # This is the most important line to fix the Keras error.
-#     K.clear_session()
-    
-#     aqi_values = list(aqi_values_tuple)
-#     data = np.array(aqi_values).reshape(-1, 1)
-#     if np.all(data == data[0]):
-#         data = data + np.random.normal(0, 1, len(data)).reshape(-1, 1)
-
-#     scaler = MinMaxScaler(feature_range=(0, 1))
-#     scaled = scaler.fit_transform(data)
-#     time_step = min(24, len(scaled) - 1)
-#     if time_step <= 0: return np.array([data[-1][0]] * steps)
-
-#     X, y = [], []
-#     for i in range(len(scaled) - time_step):
-#         X.append(scaled[i:(i + time_step), 0])
-#         y.append(scaled[i + time_step, 0])
-
-#     if not X: return np.array([data[-1][0]] * steps)
-
-#     X, y = np.array(X), np.array(y)
-#     X = X.reshape(X.shape[0], X.shape[1], 1)
-    
-#     model = Sequential([
-#         LSTM(50, input_shape=(X.shape[1], 1), return_sequences=True, name='lstm_1'),
-#         Dropout(0.2),
-#         LSTM(50, name='lstm_2'),
-#         Dropout(0.2),
-#         Dense(1)
-#     ])
-#     model.compile(loss='mean_squared_error', optimizer='adam')
-#     model.fit(X, y, epochs=20, batch_size=1, verbose=0)
-    
-#     temp_input = list(scaled[-time_step:].flatten())
-#     forecast = []
-#     for _ in range(steps):
-#         x_input = np.array(temp_input[-time_step:]).reshape(1, time_step, 1)
-#         pred = model.predict(x_input, verbose=0)[0][0]
-#         forecast.append(pred)
-#         temp_input.append(pred)
-
-#     return scaler.inverse_transform(np.array(forecast).reshape(-1, 1)).flatten()
-
-def lstm_multi_step_forecast(aqi_values_tuple, steps=168):
-    """
-    Multi-step LSTM forecast for AQI.
-    - aqi_values_tuple: past AQI values as a tuple
-    - steps: forecast horizon (default 168 hours = 7 days)
-    """
-
-    # --- Reset backend session ---
-    K.clear_session()
-
-    # --- Fix random seeds ---
-    np.random.seed(42)
-
-    # Prepare data
-    values = np.array(aqi_values_tuple, dtype=np.float32)
-    if np.isnan(values).any():
-        values = np.nan_to_num(values, nan=np.nanmean(values))
-    values = values.reshape(-1, 1)
-
-    # Normalize
-    scaler = MinMaxScaler(feature_range=(0, 1))
-    values_scaled = scaler.fit_transform(values)
-
-    # Create sequences
-    def create_dataset(series, look_back=24):
-        X, y = [], []
-        for i in range(len(series) - look_back):
-            X.append(series[i:i+look_back])
-            y.append(series[i+look_back])
-        return np.array(X), np.array(y)
-
-    look_back = 24
-    X, y = create_dataset(values_scaled, look_back)
-    if X.size == 0:  # Not enough data
-        return np.array([values[-1][0]] * steps)
-
-    X = np.reshape(X, (X.shape[0], X.shape[1], 1))
-
-    # Build model
-    model = Sequential([
-        LSTM(50, input_shape=(look_back, 1), return_sequences=True, name="lstm_1"),
-        Dropout(0.2, seed=42),
-        LSTM(50, return_sequences=False, name="lstm_2"),
-        Dropout(0.2, seed=42),
-        Dense(1)
-    ])
-    model.compile(loss="mse", optimizer="adam")
-
-    # Train
-    model.fit(X, y, epochs=20, batch_size=16, verbose=0)
-
-    # Forecast
-    forecast_input = values_scaled[-look_back:].reshape(1, look_back, 1)
-    forecast_scaled = []
-    for _ in range(steps):
-        next_val = model.predict(forecast_input, verbose=0)[0][0]
-        forecast_scaled.append(next_val)
-        forecast_input = np.append(forecast_input[:, 1:, :], [[[next_val]]], axis=1)
-
-    forecast = scaler.inverse_transform(np.array(forecast_scaled).reshape(-1, 1)).flatten()
+def mock_lstm_forecast(past_aqi, steps=168):
+    """A mock forecasting function to simulate a more complex model without heavy dependencies."""
+    if not past_aqi: return [75] * steps
+    last_value = past_aqi[-1]
+    forecast = []
+    for i in range(steps):
+        cyclical_trend = 15 * np.sin(2 * np.pi * ((len(past_aqi) + i) % 24) / 24)
+        random_noise = np.random.normal(0, 3)
+        next_value = last_value * 0.95 + (75 * 0.05) + cyclical_trend + random_noise
+        forecast.append(max(10, next_value))
+        last_value = next_value
     return forecast
 
-
-
-
-
-
 def find_optimal_route(start_id, end_id, zones_df, mode='safest'):
+    """Calculates the optimal route using Dijkstra's algorithm."""
     zones_map = zones_df.set_index('id').to_dict('index')
     
     def get_weight(zone_id):
-        if mode == 'shortest':
-            return 1
-        zone = zones_map[zone_id]
+        zone = zones_map.get(zone_id)
+        if not zone: return float('inf')
+        if mode == 'shortest': return 1
+        
         aqi_cost = zone['aqi']
         temp_cost = max(0, zone['temperature'] - 38) * 10
         return 1 + aqi_cost + temp_cost
 
-    dist = {zone['id']: float('inf') for zone in HYDERABAD_ZONES_BASE}
-    dist[start_id] = 0
-    prev = {zone['id']: None for zone in HYDERABAD_ZONES_BASE}
+    dist = {zone['id']: float('inf') for _, zone in zones_df.iterrows()}
+    prev = {zone['id']: None for _, zone in zones_df.iterrows()}
     pq = [(0, start_id)]
+    dist[start_id] = 0
 
     while pq:
         d, u = heapq.heappop(pq)
+
         if d > dist[u]:
             continue
         if u == end_id:
             break
+
         for v in ZONE_GRAPH.get(u, []):
             weight = get_weight(v)
             if dist[u] + weight < dist[v]:
@@ -345,6 +249,9 @@ def find_optimal_route(start_id, end_id, zones_df, mode='safest'):
         return [], 0, 0
 
     path_zones = zones_df[zones_df['id'].isin(path)]
+    if path_zones.empty:
+        return [], 0, 0
+        
     return path, path_zones['aqi'].mean(), path_zones['temperature'].mean()
 
 def get_aqi_recommendation(aqi):
@@ -416,16 +323,6 @@ with tab1:
 
     with col2:
         st.header("Simulation Controls")
-        status_map = {
-            'INITIAL': ("Ready to begin simulation.", "info"),
-            'DQN_COMPLETE': ("Hotspots identified.", "info"),
-            'DDPG_COMPLETE': ("Intensity calculated.", "info"),
-            'INTEGRATED_COMPLETE': ("Full scenario complete!", "success")
-        }
-        msg, type = status_map.get(st.session_state.stage, ("Processing...", "info"))
-        if type == "success": st.success(msg)
-        else: st.info(msg)
-
         if st.session_state.error: st.error(st.session_state.error)
 
         if st.button("1. Identify Hotspots (DQN)", type="primary", use_container_width=True, disabled=st.session_state.stage != 'INITIAL'):
@@ -453,7 +350,7 @@ with tab1:
 
 # --- TAB 2: AQI FORECAST ---
 with tab2:
-    st.header("Live AQI & 7-Day LSTM Forecast")
+    st.header("Live AQI & 7-Day Forecast")
     st.markdown("📍 Click anywhere on the map to get a location-specific AQI forecast, or use the default baseline station.")
     
     m = folium.Map(location=[DEFAULT_LAT, DEFAULT_LON], zoom_start=11)
@@ -480,16 +377,16 @@ with tab2:
         rec, color = get_aqi_recommendation(latest_aqi)
         st.metric(label="Live Air Quality Index (AQI)", value=int(latest_aqi))
         st.markdown(f"**Condition:** <span style='color:{color};'>{rec}</span>", unsafe_allow_html=True)
-        cols = st.columns(2)
-        cols[0].metric(label="PM2.5", value=f"{latest_pm25} µg/m³" if not np.isnan(latest_pm25) else "N/A")
-        cols[1].metric(label="PM10", value=f"{latest_pm10} µg/m³" if not np.isnan(latest_pm10) else "N/A")
+        c1, c2 = st.columns(2)
+        c1.metric(label="PM2.5", value=f"{latest_pm25} µg/m³" if not np.isnan(latest_pm25) else "N/A")
+        c2.metric(label="PM10", value=f"{latest_pm10} µg/m³" if not np.isnan(latest_pm10) else "N/A")
     else:
         st.warning("Live AQI data unavailable for this location. Using historical average for forecast.")
 
-    with st.spinner("Generating historical data & training LSTM model... This might take a minute."):
+    with st.spinner("Generating historical data & creating forecast..."):
         _, past_aqi = generate_past_aqi(latest_aqi)
         if latest_aqi and not np.isnan(latest_aqi): past_aqi[-1] = latest_aqi
-        full_forecast = lstm_multi_step_forecast(tuple(past_aqi), 168)
+        full_forecast = mock_lstm_forecast(past_aqi, steps=168)
 
     st.markdown("#### 🔮 Next 7 Days Forecast (Daily Average)")
     daily_avg_forecast = [np.mean(full_forecast[i*24:(i+1)*24]) for i in range(7)]
@@ -504,81 +401,7 @@ with tab2:
     st.plotly_chart(fig, use_container_width=True)
 
 
-# --- TAB 3: ROUTE RECOMMENDATION (STATEFUL) ---
-# with tab3:
-#     st.header("Intelligent Route Recommendation")
-#     st.markdown("Find the safest (lowest pollution & heat exposure) or the shortest route between two zones.")
-#     zones_df = st.session_state.zones
-#     zone_names = zones_df.set_index('id')['name'].to_dict()
-    
-#     col1, col2 = st.columns(2)
-#     start_name = col1.selectbox("Select Start Location", options=zone_names.values(), index=0, key="start_loc")
-#     end_name = col2.selectbox("Select End Location", options=zone_names.values(), index=len(zone_names)-1, key="end_loc")
-    
-#     if st.button("Find Routes", type="primary", use_container_width=True):
-#         if start_name == end_name:
-#             st.error("Start and End locations cannot be the same.")
-#         else:
-#             with st.spinner("Calculating safest and shortest routes..."):
-#                 start_id = next((id for id, name in zone_names.items() if name == start_name), None)
-#                 end_id = next((id for id, name in zone_names.items() if name == end_name), None)
-#                 safe_path, safe_aqi, safe_temp = find_optimal_route(start_id, end_id, zones_df, 'safest')
-#                 short_path, short_aqi, short_temp = find_optimal_route(start_id, end_id, zones_df, 'shortest')
-#                 st.session_state.route_result = {
-#                     "safe_path": safe_path, "safe_aqi": safe_aqi, "safe_temp": safe_temp,
-#                     "short_path": short_path, "short_aqi": short_aqi, "short_temp": short_temp,
-#                     "start_id": start_id, "end_id": end_id
-#                 }
-
-#     if st.session_state.get('route_result'):
-#         res = st.session_state.route_result
-#         st.subheader("Route Visualization")
-#         route_map = folium.Map(location=[DEFAULT_LAT, DEFAULT_LON], zoom_start=11)
-        
-#         if res["safe_path"]:
-#             #safe_coords = [(zones_df.loc[zones_df['id'] == zid, 'lat'].iloc[0], zones_df.loc[zones_df['id'] == zid, 'lon'].iloc[0]) for zid in res["safe_path"]]
-#             safe_coords = [
-#     (row['lat'], row['lon'])
-#     for zid in res["safe_path"]
-#     for _, row in zones_df[zones_df['id'] == zid].iterrows()
-# ]
-
-#             folium.PolyLine(safe_coords, color='green', weight=6, opacity=0.8, tooltip="Safest Route").add_to(route_map)
-#         if res["short_path"]:
-#             short_coords = [(zones_df.loc[zones_df['id'] == zid, 'lat'].iloc[0], zones_df.loc[zones_df['id'] == zid, 'lon'].iloc[0]) for zid in res["short_path"]]
-#             folium.PolyLine(short_coords, color='red', weight=3, opacity=0.8, dash_array='5, 5', tooltip="Shortest Route").add_to(route_map)
-        
-#         start_zone = zones_df.loc[zones_df['id'] == res["start_id"]].iloc[0]
-#         end_zone = zones_df.loc[zones_df['id'] == res["end_id"]].iloc[0]
-#         folium.Marker([start_zone['lat'], start_zone['lon']], popup=f"START: {start_zone['name']}", icon=folium.Icon(color='green', icon='play')).add_to(route_map)
-#         folium.Marker([end_zone['lat'], end_zone['lon']], popup=f"END: {end_zone['name']}", icon=folium.Icon(color='red', icon='stop')).add_to(route_map)
-        
-#         st_folium(route_map, height=450, width=700)
-        
-#         res_col1, res_col2 = st.columns(2)
-#         with res_col1:
-#             st.markdown("##### 🏆 Safest Route (Recommended)")
-#             if res["safe_path"]:
-#                 st.markdown(f"**Path:** {' → '.join([zone_names[zid] for zid in res['safe_path']])}")
-#                 c1, c2 = st.columns(2); c1.metric("Avg AQI Exposure", f"{res['safe_aqi']:.1f}"); c2.metric("Avg Temp", f"{res['safe_temp']:.1f}°C")
-#             else: st.warning("No safe route found.")
-#         with res_col2:
-#             st.markdown("##### 📏 Standard Shortest Route")
-#             if res["short_path"]:
-#                 st.markdown(f"**Path:** {' → '.join([zone_names[zid] for zid in res['short_path']])}")
-#                 c1, c2 = st.columns(2); c1.metric("Avg AQI Exposure", f"{res['short_aqi']:.1f}"); c2.metric("Avg Temp", f"{res['short_temp']:.1f}°C")
-#             else: st.warning("No shortest route found.")
-        
-#         if res["safe_path"] and res["short_path"] and res["safe_aqi"] < res["short_aqi"]:
-#             improvement = ((res["short_aqi"] - res["safe_aqi"]) / res["short_aqi"]) * 100
-#             st.success(f"By choosing the safest route, you can reduce pollution exposure by **{improvement:.0f}%**!")
-
-
-
-
-
-
-
+# --- TAB 3: ROUTE RECOMMENDATION ---
 with tab3:
     st.header("Intelligent Route Recommendation")
     st.markdown("Find the safest (lowest pollution & heat exposure) or the shortest route between two zones.")
@@ -609,86 +432,40 @@ with tab3:
         st.subheader("Route Visualization")
         route_map = folium.Map(location=[DEFAULT_LAT, DEFAULT_LON], zoom_start=11)
 
-        # Safest Route
+        def get_coords(path):
+            return [(zones_df.loc[zones_df['id'] == zid, 'lat'].iloc[0], zones_df.loc[zones_df['id'] == zid, 'lon'].iloc[0]) for zid in path]
+
         if res["safe_path"]:
-            safe_coords = [
-                (row['lat'], row['lon'])
-                for zid in res["safe_path"]
-                for _, row in zones_df[zones_df['id'] == zid].iterrows()
-            ]
-            if safe_coords:
-                folium.PolyLine(
-                    safe_coords, color='green', weight=6, opacity=0.8, tooltip="Safest Route"
-                ).add_to(route_map)
-
-        # Shortest Route
+            folium.PolyLine(get_coords(res["safe_path"]), color='green', weight=6, opacity=0.8, tooltip="Safest Route").add_to(route_map)
         if res["short_path"]:
-            short_coords = [
-                (row['lat'], row['lon'])
-                for zid in res["short_path"]
-                for _, row in zones_df[zones_df['id'] == zid].iterrows()
-            ]
-            if short_coords:
-                folium.PolyLine(
-                    short_coords, color='red', weight=3, opacity=0.8,
-                    dash_array='5, 5', tooltip="Shortest Route"
-                ).add_to(route_map)
-
-        # Start & End Markers
-        try:
-            start_zone = zones_df.loc[zones_df['id'] == res["start_id"]].iloc[0]
-            folium.Marker(
-                [start_zone['lat'], start_zone['lon']],
-                popup=f"START: {start_zone['name']}",
-                icon=folium.Icon(color='green', icon='play')
-            ).add_to(route_map)
-        except IndexError:
-            st.warning("⚠️ Start zone not found in dataset.")
-
-        try:
-            end_zone = zones_df.loc[zones_df['id'] == res["end_id"]].iloc[0]
-            folium.Marker(
-                [end_zone['lat'], end_zone['lon']],
-                popup=f"END: {end_zone['name']}",
-                icon=folium.Icon(color='red', icon='stop')
-            ).add_to(route_map)
-        except IndexError:
-            st.warning("⚠️ End zone not found in dataset.")
-
+            folium.PolyLine(get_coords(res["short_path"]), color='red', weight=3, opacity=0.8, dash_array='5, 5', tooltip="Shortest Route").add_to(route_map)
+        
+        start_zone = zones_df.loc[zones_df['id'] == res["start_id"]].iloc[0]
+        end_zone = zones_df.loc[zones_df['id'] == res["end_id"]].iloc[0]
+        folium.Marker([start_zone['lat'], start_zone['lon']], popup=f"START: {start_zone['name']}", icon=folium.Icon(color='green', icon='play')).add_to(route_map)
+        folium.Marker([end_zone['lat'], end_zone['lon']], popup=f"END: {end_zone['name']}", icon=folium.Icon(color='red', icon='stop')).add_to(route_map)
+        
         st_folium(route_map, height=450, width=700)
-
-        # Results Section
+        
         res_col1, res_col2 = st.columns(2)
         with res_col1:
             st.markdown("##### 🏆 Safest Route (Recommended)")
             if res["safe_path"]:
-                st.markdown(f"**Path:** {' → '.join([zone_names.get(zid, str(zid)) for zid in res['safe_path']])}")
-                c1, c2 = st.columns(2)
-                c1.metric("Avg AQI Exposure", f"{res['safe_aqi']:.1f}")
-                c2.metric("Avg Temp", f"{res['safe_temp']:.1f}°C")
-            else:
-                st.warning("No safe route found.")
-
+                st.markdown(f"**Path:** {' → '.join([zone_names[zid] for zid in res['safe_path']])}")
+                c1, c2 = st.columns(2); c1.metric("Avg AQI Exposure", f"{res['safe_aqi']:.1f}"); c2.metric("Avg Temp", f"{res['safe_temp']:.1f}°C")
+            else: st.warning("No safe route found.")
         with res_col2:
             st.markdown("##### 📏 Standard Shortest Route")
             if res["short_path"]:
-                st.markdown(f"**Path:** {' → '.join([zone_names.get(zid, str(zid)) for zid in res['short_path']])}")
-                c1, c2 = st.columns(2)
-                c1.metric("Avg AQI Exposure", f"{res['short_aqi']:.1f}")
-                c2.metric("Avg Temp", f"{res['short_temp']:.1f}°C")
-            else:
-                st.warning("No shortest route found.")
-
+                st.markdown(f"**Path:** {' → '.join([zone_names[zid] for zid in res['short_path']])}")
+                c1, c2 = st.columns(2); c1.metric("Avg AQI Exposure", f"{res['short_aqi']:.1f}"); c2.metric("Avg Temp", f"{res['short_temp']:.1f}°C")
+            else: st.warning("No shortest route found.")
+        
         if res["safe_path"] and res["short_path"] and res["safe_aqi"] < res["short_aqi"]:
             improvement = ((res["short_aqi"] - res["safe_aqi"]) / res["short_aqi"]) * 100
             st.success(f"By choosing the safest route, you can reduce pollution exposure by **{improvement:.0f}%**!")
 
-
-
-
-
-
-# --- TAB 4: ZONE CLUSTERING (STATEFUL) ---
+# --- TAB 4: ZONE CLUSTERING ---
 with tab4:
     st.header("Dynamic Zone Clustering (DBSCAN)")
     st.markdown("This analysis uses unsupervised learning to group zones with similar environmental conditions.")
