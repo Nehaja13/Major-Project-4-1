@@ -5,8 +5,12 @@ import time
 import json
 import requests
 from datetime import datetime, timedelta
-import hashlib
 import heapq
+from streamlit_geolocation import streamlit_geolocation
+import openrouteservice
+from openrouteservice.exceptions import ApiError
+import urllib.parse
+from folium.features import DivIcon
 
 # AI and ML Imports
 import google.generativeai as genai
@@ -20,7 +24,6 @@ import folium
 import plotly.express as px
 
 # --- 1. CONFIGURATION & PAGE SETUP ---
-
 st.set_page_config(
     page_title="Hyderabad Environmental Intelligence",
     page_icon="🌍",
@@ -28,25 +31,30 @@ st.set_page_config(
 )
 
 # --- SECRETS MANAGEMENT ---
-# Attempt to get secrets. If they are not found, display an error and instructions.
 try:
     GEMINI_API_KEY = st.secrets["GEMINI_API_KEY"]
     AQI_API_KEY = st.secrets["AQI_API_KEY"]
+    ORS_API_KEY = st.secrets["ORS_API_KEY"]
     genai.configure(api_key=GEMINI_API_KEY)
 except (FileNotFoundError, KeyError):
     st.error("🚨 API Keys not found! Please configure your Streamlit secrets.")
-    st.info("To run this app, create a file at `.streamlit/secrets.toml` with your API keys.")
+    st.info("Ensure you have a file at `.streamlit/secrets.toml` in your project's root folder.")
     st.code("""
 # .streamlit/secrets.toml
 GEMINI_API_KEY = "YOUR_GEMINI_API_KEY_HERE"
 AQI_API_KEY = "YOUR_AQI_API_KEY_HERE"
+ORS_API_KEY = "YOUR_ORS_API_KEY_HERE" # Get from https://openrouteservice.org/
     """)
     st.stop()
 
+# Initialize OpenRouteService client
+try:
+    ors_client = openrouteservice.Client(key=ORS_API_KEY)
+except Exception as e:
+    st.error(f"Failed to initialize ORS client. Check ORS_API_KEY. Error: {e}")
+    st.stop()
 
 # --- 2. SHARED DATA & CONSTANTS ---
-
-# Base data for Hyderabad zones
 HYDERABAD_ZONES_BASE = [
     {'id': 1, 'name': 'Banjara Hills', 'type': 'Posh Residential', 'lat': 17.414, 'lon': 78.435},
     {'id': 2, 'name': 'Gachibowli', 'type': 'Financial District', 'lat': 17.44, 'lon': 78.34},
@@ -60,54 +68,70 @@ HYDERABAD_ZONES_BASE = [
     {'id': 10, 'name': 'Jubilee Hills', 'type': 'Posh Residential', 'lat': 17.43, 'lon': 78.4},
     {'id': 11, 'name': 'Ameerpet', 'type': 'Commercial Hub', 'lat': 17.437, 'lon': 78.448},
     {'id': 12, 'name': 'Kukatpally', 'type': 'Dense Residential', 'lat': 17.485, 'lon': 78.4},
+    {'id': 13, 'name': 'Bachupally', 'type': 'Educational Hub', 'lat': 17.53, 'lon': 78.4},
 ]
-
-# Defines connections between zones for routing
-ZONE_GRAPH = {
-  1: [10, 11, 7], 2: [5, 12], 3: [12], 4: [6], 5: [2, 12, 10],
-  6: [4, 9, 8, 11], 7: [1, 10], 8: [6], 9: [6, 11],
-  10: [1, 5, 7, 11], 11: [1, 9, 10, 6], 12: [2, 3, 5],
-}
-
-# Default map coordinates and baseline station location
+ZONE_GRAPH = { 1: [10, 11, 7], 2: [5, 12], 3: [12, 13], 4: [6], 5: [2, 12, 10], 6: [4, 9, 8, 11], 7: [1, 10], 8: [6], 9: [6, 11], 10: [1, 5, 7, 11], 11: [1, 9, 10, 6], 12: [2, 3, 5, 13], 13: [12, 3]}
 DEFAULT_LAT, DEFAULT_LON = 17.43, 78.45
 BASELINE_STATION_LAT, BASELINE_STATION_LON = 17.4557, 78.4280
 
 # --- 3. CORE LOGIC & HELPER FUNCTIONS ---
 
+def get_intensity_description(intensity):
+    if intensity <= 0.5: return "Low: Requires monitoring and minor interventions."
+    if intensity <= 0.7: return "Medium: Needs targeted actions like cooling centers."
+    if intensity <= 0.9: return "High: Demands significant resources, like mobile cooling vans."
+    return "Critical: Urgent, large-scale response required."
+
+
+def get_cluster_label(cluster_df, cluster_id):
+    if cluster_id == -1: return "Outliers"
+    cluster_data = cluster_df[cluster_df['cluster'] == cluster_id]
+    mean_temp, mean_aqi = cluster_data['temperature'].mean(), cluster_data['aqi'].mean()
+    if mean_temp > 41 and mean_aqi > 110: return "Extreme Heat & Pollution"
+    if mean_temp > 41: return "Heat Hotspots"
+    if mean_aqi > 110: return "Pollution Hotspots"
+    if mean_temp < 39 and mean_aqi < 90: return "Cool & Clean Zones"
+    return f"Moderate Cluster {cluster_id}"
+
 @st.cache_data
 def get_realistic_hyderabad_zones(baseline_aqi, baseline_temp):
-    """Generates simulated environmental data for zones based on their type."""
+    # smaller per-zone temperature offsets and less random noise for realism
     offsets = {
-        'Industrial': {'temp': +4, 'aqi': +50}, 'Dense Residential': {'temp': +3, 'aqi': +20},
-        'Commercial Hub': {'temp': +3, 'aqi': +30}, 'Historic/Market': {'temp': +2, 'aqi': +40},
-        'Transport Hub': {'temp': +2, 'aqi': +35}, 'IT Hub': {'temp': +1, 'aqi': +15},
-        'Financial District': {'temp': +1, 'aqi': +10}, 'Commercial/Residential': {'temp': +1, 'aqi': +25},
-        'Posh Residential': {'temp': 0, 'aqi': -5}, 'Residential/Industrial': {'temp': +2, 'aqi': +45},
-        'Green Space': {'temp': -4, 'aqi': -30},
+        'Industrial': {'temp': +3, 'aqi': +50},
+        'Dense Residential': {'temp': +1, 'aqi': +20},
+        'Commercial Hub': {'temp': +1, 'aqi': +30},
+        'Historic/Market': {'temp': +1, 'aqi': +40},
+        'Transport Hub': {'temp': +1, 'aqi': +35},
+        'IT Hub': {'temp': 0, 'aqi': +15},
+        'Financial District': {'temp': 0, 'aqi': +10},
+        'Commercial/Residential': {'temp': 0, 'aqi': +25},
+        'Posh Residential': {'temp': -1, 'aqi': -5},
+        'Residential/Industrial': {'temp': +1, 'aqi': +45},
+        'Green Space': {'temp': -3, 'aqi': -30},
+        'Educational Hub': {'temp': 0, 'aqi': +20}
     }
     zones = []
-    for zone in HYDERABAD_ZONES_BASE:
-        z = zone.copy()
-        offset = offsets.get(z['type'], {'temp': 0, 'aqi': 0})
-        z.update({
-            'temperature': baseline_temp + offset['temp'] + np.random.uniform(-1, 1),
-            'aqi': max(20, baseline_aqi + offset['aqi'] + np.random.randint(-5, 5)),
+    for z in HYDERABAD_ZONES_BASE:
+        offs = offsets.get(z['type'], {'temp': 0, 'aqi': 0})
+        temp = baseline_temp + offs['temp'] + np.random.uniform(-0.7, 0.7)  # smaller jitter
+        aqi = max(10, int(baseline_aqi + offs['aqi'] + np.random.randint(-5, 6)))
+        zones.append({
+            'id': z['id'], 'name': z['name'], 'type': z['type'], 'lat': z['lat'], 'lon': z['lon'],
+            'temperature': round(temp, 1), 'aqi': aqi,
             'needs_intervention': False, 'mitigation_intensity': 0.0, 'suggestion': '', 'image_url': ''
         })
-        zones.append(z)
     return pd.DataFrame(zones)
 
+
 def run_dqn_simulation():
-    """Simulates identifying critical hotspots based on temperature and AQI thresholds."""
     st.session_state.logs.append("DQN: Identifying hotspots...")
     zones_df = st.session_state.zones.copy()
     zones_df['needs_intervention'] = (zones_df['temperature'] > 40) & (zones_df['aqi'] > 100)
     st.session_state.zones = zones_df
     st.session_state.logs.append(f"DQN Complete: {zones_df['needs_intervention'].sum()} critical zones found.")
 
+
 def run_ddpg_simulation():
-    """Simulates calculating the required intensity for mitigation actions."""
     st.session_state.logs.append("DDPG: Calculating mitigation intensity...")
     zones_df = st.session_state.zones.copy()
     for i, row in zones_df.iterrows():
@@ -116,146 +140,222 @@ def run_ddpg_simulation():
     st.session_state.zones = zones_df
     st.session_state.logs.append("DDPG Complete: Intensities assigned.")
 
+
+def _build_image_prompt_for_zone(zone):
+    prompts = [
+        "photorealistic",
+        f"{zone.get('name', 'Hyderabad')}",
+        f"{zone.get('type', '')}",
+        "urban mitigation",
+        "shaded walkways",
+        "cool roofs",
+        "vegetation",
+        "community engagement"
+    ]
+    return ", ".join([p for p in prompts if p])
+
+
+
 def run_gemini_suggestions():
-    """Contacts Gemini API to get mitigation suggestions for critical zones."""
-    st.session_state.logs.append("Contacting Gemini API...")
+    st.session_state.logs.append("Contacting Gemini API with enhanced prompt...")
+
     hotspots = st.session_state.zones[st.session_state.zones['needs_intervention']]
     if hotspots.empty:
-        st.session_state.error = "No critical hotspots identified to generate suggestions."
+        st.session_state.error = "No critical hotspots identified."
         return
 
     model = genai.GenerativeModel('gemini-2.5-flash')
-    details = "\n".join([f'- Zone ID: {z["id"]}, Name: "{z["name"]}" ({z["type"]}), Temp: {z["temperature"]:.1f}°C, AQI: {z["aqi"]}, Intensity: {z["mitigation_intensity"]:.2f}' for _, z in hotspots.iterrows()])
-    
-    prompt = f"""You are an expert urban planning AI for Hyderabad, India. You specialize in creative, practical, and culturally relevant strategies for heat and pollution mitigation. For each of the "Critical Zones" listed below, provide a tailored cooling and air quality improvement strategy.
 
-Your response MUST be a single, valid JSON object with one key: "suggestions". This key should contain a list of objects, where each object has three keys: "zoneId" (integer), "detailed_suggestion" (a multi-line string with markdown bullet points), and "image_prompt" (a descriptive prompt for an AI image generator).
+    details = "\n".join(
+        f"- Zone ID: {row['id']}, Name: {row['name']}, Type: {row['type']}, "
+        f"Temp: {row['temperature']:.1f}°C, AQI: {row['aqi']}"
+        for _, row in hotspots.iterrows()
+    )
 
-IMPORTANT: Within the "detailed_suggestion" JSON string value, you MUST use the two-character sequence '\\n' to represent line breaks. Do not use literal newlines.
-
-Critical Zones:
-{details}
-"""
+    # Create the structured prompt
+    prompt = f"""You are an expert urban planning AI for Hyderabad. For each zone below, provide a tailored mitigation strategy.
+    Respond in a single JSON object: {{"suggestions": [{{"zoneId": <int>, "detailed_suggestion": "<str>", "image_prompt": "<str>"}}]}}.
+    For 'image_prompt', create a descriptive, comma-separated keyword list for a photorealistic image showing the solution in action.
+    Use \\n for newlines in 'detailed_suggestion'.
+    Critical Zones:
+    {details}
+    """
 
     try:
-        generation_config = GenerationConfig(response_mime_type="application/json")
-        safety_settings = [{"category": c, "threshold": HarmBlockThreshold.BLOCK_NONE} for c in HarmCategory if c != HarmCategory.HARM_CATEGORY_UNSPECIFIED]
-        
+        config = GenerationConfig(response_mime_type="application/json")
+        safety_settings = {
+            c: HarmBlockThreshold.BLOCK_NONE
+            for c in HarmCategory
+            if c != HarmCategory.HARM_CATEGORY_UNSPECIFIED
+        }
+
         response = model.generate_content(
             prompt,
-            generation_config=generation_config,
+            generation_config=config,
             safety_settings=safety_settings
         )
-        
-        suggestions = json.loads(response.text).get("suggestions", [])
+
+        suggestions = []
+        parsed = None
+        response_text = None
+
+        # Try parsing JSON safely
+        try:
+            response_text = getattr(response, 'text', None) or str(response)
+            parsed = json.loads(response_text)
+        except Exception:
+            try:
+                if hasattr(response, 'candidates') and response.candidates:
+                    cand_text = response.candidates[0].get('content', response.candidates[0].get('message', ''))
+                    parsed = json.loads(cand_text)
+            except Exception:
+                parsed = None
+
+        if parsed and isinstance(parsed, dict) and parsed.get('suggestions'):
+            suggestions = parsed.get('suggestions')
+
+        # Fallback suggestions if Gemini response fails
         if not suggestions:
-            st.session_state.error = "AI returned no suggestions. The model may be temporarily unavailable."
-            return
+            st.session_state.logs.append('Gemini response parsing failed or returned no suggestions; using fallback generator.')
+            for _, z in hotspots.iterrows():
+                detailed = (
+                    "Immediate measures: deploy mobile misting fans and temporary shaded canopies.\n"
+                    "Mid-term: install cool roofs and increase tree canopy along main walkways.\n"
+                    "Community: run heat awareness and distribution of hydration kits."
+                )
+                img_prompt = _build_image_prompt_for_zone(z)
+                suggestions.append({
+                    "zoneId": int(z['id']),
+                    "detailed_suggestion": detailed,
+                    "image_prompt": img_prompt
+                })
 
         zones_df = st.session_state.zones.copy()
+
+        # Process AI suggestions
         for s in suggestions:
-            zone_id = s.get('zoneId')
-            if zone_id is not None:
-                suggestion_text = s.get('detailed_suggestion', '').replace('\\n', '<br>')
-                zones_df.loc[zones_df['id'] == zone_id, 'suggestion'] = suggestion_text
-                
-                image_prompt = s.get('image_prompt', 'abstract cityscape')
-                seed = hashlib.md5(image_prompt.encode()).hexdigest()
-                zones_df.loc[zones_df['id'] == zone_id, 'image_url'] = f"https://picsum.photos/seed/{seed}/400/300"
-                
+            try:
+                zid = int(s.get('zoneId') or s.get('zone_id') or s.get('id'))
+            except Exception:
+                zid = None
+
+            detailed_suggestion = s.get('detailed_suggestion', '')
+            if detailed_suggestion:
+                detailed_suggestion = detailed_suggestion.replace('\\n', '\n')
+
+            image_prompt = s.get('image_prompt', '')
+            if not image_prompt:
+                zone_row = zones_df[zones_df['id'] == zid] if zid is not None else None
+                if zone_row is not None and not zone_row.empty:
+                    image_prompt = _build_image_prompt_for_zone(zone_row.iloc[0])
+                else:
+                    image_prompt = 'photorealistic, urban mitigation, shaded walkway, cool roofs'
+
+            safe_query = urllib.parse.quote_plus(image_prompt.replace(',', ''))
+            image_url = f"https://source.unsplash.com/featured/?{safe_query}"
+
+            if zid is not None and zid in zones_df['id'].values:
+                zones_df.loc[zones_df['id'] == zid, ['suggestion', 'image_url']] = [detailed_suggestion, image_url]
+            else:
+                for _, z in zones_df.iterrows():
+                    if z['name'].lower() in detailed_suggestion.lower():
+                        zones_df.loc[zones_df['id'] == z['id'], ['suggestion', 'image_url']] = [detailed_suggestion, image_url]
+
         st.session_state.zones = zones_df
-        st.session_state.logs.append(f"Gemini Complete: Parsed {len(suggestions)} mitigation strategies.")
+        st.session_state.logs.append(f"Gemini Complete: Parsed {len(suggestions)} strategies.")
+
     except Exception as e:
         st.session_state.error = f"Failed to get or parse AI response: {e}"
-        st.session_state.logs.append(f"Gemini Error: {e}")
 
-@st.cache_data(ttl=3600) # Cache API calls for 1 hour
+
+
+@st.cache_data(ttl=3600)
 def fetch_aqi_from_api(lat, lon):
-    """Fetches live AQI data from the World Air Quality Index project."""
     url = f"https://api.waqi.info/feed/geo:{lat};{lon}/?token={AQI_API_KEY}"
     try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        data = response.json()
+        r = requests.get(url, timeout=10)
+        r.raise_for_status()
+        data = r.json()
         if data.get("status") == "ok":
-            aqi = data["data"].get("aqi", np.nan)
-            pm25 = data["data"]["iaqi"].get("pm25", {}).get("v", np.nan)
-            pm10 = data["data"]["iaqi"].get("pm10", {}).get("v", np.nan)
-            return aqi, pm25, pm10
-    except requests.exceptions.RequestException as e:
-        st.warning(f"Could not fetch live AQI data: {e}")
-    return np.nan, np.nan, np.nan
+            aqi = data["data"].get("aqi")
+            pm25 = data["data"].get("iaqi", {}).get("pm25", {}).get("v")
+            pm10 = data["data"].get("iaqi", {}).get("pm10", {}).get("v")
 
-def generate_past_aqi(latest_aqi, hours=168):
-    """Generates a week of simulated historical AQI data for forecasting."""
-    base = latest_aqi if latest_aqi and not np.isnan(latest_aqi) else 75
-    past = [max(10, base + 15 * np.sin(2*np.pi*(i%24)/24) + np.random.normal(0, 5)) for i in range(hours)]
-    times = [(datetime.now() - timedelta(hours=hours - i)) for i in range(hours)]
-    return times, past
+            if pd.notna(pm25) and not pd.notna(pm10):
+                pm10 = pm25 * 1.5 + np.random.uniform(-5, 5)
 
-def mock_lstm_forecast(past_aqi, steps=168):
-    """A mock forecasting function to simulate a more complex model without heavy dependencies."""
-    if not past_aqi: return [75] * steps
+            return (aqi, pm25, pm10)
+    except requests.exceptions.RequestException:
+        return np.nan, np.nan, np.nan
+
+
+def generate_past_aqi(latest_aqi):
+    base = latest_aqi if pd.notna(latest_aqi) else 75
+    return None, [max(10, base + 15 * np.sin(2*np.pi*(i%24)/24) + np.random.normal(0, 5)) for i in range(168)]
+
+
+def mock_lstm_forecast(past_aqi):
+    if not past_aqi: return [75] * 168
     last_value = past_aqi[-1]
     forecast = []
-    for i in range(steps):
-        cyclical_trend = 15 * np.sin(2 * np.pi * ((len(past_aqi) + i) % 24) / 24)
-        random_noise = np.random.normal(0, 3)
-        next_value = last_value * 0.95 + (75 * 0.05) + cyclical_trend + random_noise
+    for i in range(168):
+        cyclical_trend = 15 * np.sin(2*np.pi*((len(past_aqi)+i)%24)/24)
+        noise = np.random.normal(0, 3)
+        next_value = last_value*0.95 + 75*0.05 + cyclical_trend + noise
         forecast.append(max(10, next_value))
         last_value = next_value
     return forecast
 
-def find_optimal_route(start_id, end_id, zones_df, mode='safest'):
-    """Calculates the optimal route using Dijkstra's algorithm."""
-    zones_map = zones_df.set_index('id').to_dict('index')
-    
-    def get_weight(zone_id):
-        zone = zones_map.get(zone_id)
-        if not zone: return float('inf')
-        if mode == 'shortest': return 1
-        
-        aqi_cost = zone['aqi']
-        temp_cost = max(0, zone['temperature'] - 38) * 10
-        return 1 + aqi_cost + temp_cost
+@st.cache_data
+def get_road_path(_ors_client, waypoints_coords):
+    try:
+        # ORS expects [lon, lat]
+        reversed_coords = [[c[1], c[0]] for c in waypoints_coords]
+        directions = _ors_client.directions(coordinates=reversed_coords, profile='driving-car', format='geojson')
+        path_coords = directions['features'][0]['geometry']['coordinates']
+        return [[c[1], c[0]] for c in path_coords]
+    except ApiError as e:
+        st.error(f"Could not fetch road path from OpenRouteService: {e}")
+        return waypoints_coords
 
-    dist = {zone['id']: float('inf') for _, zone in zones_df.iterrows()}
-    prev = {zone['id']: None for _, zone in zones_df.iterrows()}
+
+def find_optimal_route(start_id, end_id, zones_df, mode='safest'):
+    zones_map = zones_df.set_index('id').to_dict('index')
+    def get_weight(zone_id):
+        zone = zones_map.get(zone_id, {})
+        if mode == 'shortest': return 1
+        aqi_cost = zone.get('aqi', 1000) * 1.5
+        temp_cost = max(0, zone.get('temperature', 50) - 38) * 20
+        return 1 + aqi_cost + temp_cost
+    dist = {z['id']: float('inf') for _, z in zones_df.iterrows()}
+    prev = {z['id']: None for _, z in zones_df.iterrows()}
     pq = [(0, start_id)]
     dist[start_id] = 0
-
     while pq:
         d, u = heapq.heappop(pq)
-
-        if d > dist[u]:
-            continue
-        if u == end_id:
-            break
-
+        if d > dist.get(u, float('inf')): continue
+        if u == end_id: break
         for v in ZONE_GRAPH.get(u, []):
             weight = get_weight(v)
-            if dist[u] + weight < dist[v]:
-                dist[v] = dist[u] + weight
+            if dist.get(u, float('inf')) + weight < dist.get(v, float('inf')):
+                dist[v] = dist.get(u) + weight
                 prev[v] = u
                 heapq.heappush(pq, (dist[v], v))
-
     path = []
     curr = end_id
     while curr is not None:
-        path.insert(0, curr)
+        path.append(curr)
         curr = prev.get(curr)
-
-    if not path or path[0] != start_id:
-        return [], 0, 0
-
+    path.reverse()
+    if not path or path[0] != start_id: return [], 0, 0
     path_zones = zones_df[zones_df['id'].isin(path)]
-    if path_zones.empty:
-        return [], 0, 0
-        
+    if path_zones.empty: return [], 0, 0
     return path, path_zones['aqi'].mean(), path_zones['temperature'].mean()
 
+
 def get_aqi_recommendation(aqi):
-    if aqi is None or np.isnan(aqi): return "⚪ N/A", "#808080"
+    if not pd.notna(aqi): return "⚪ N/A", "#808080"
+    aqi = int(aqi)
     if aqi <= 50: return "✅ Good", "#28a745"
     if aqi <= 100: return "🟡 Moderate", "#ffc107"
     if aqi <= 150: return "🟠 Unhealthy for Sensitive Groups", "#fd7e14"
@@ -263,252 +363,696 @@ def get_aqi_recommendation(aqi):
     if aqi <= 300: return "🟣 Very Unhealthy", "#6f42c1"
     return "🟤 Hazardous", "#795548"
 
-# --- 4. STREAMLIT UI LAYOUT ---
-
-st.title("🌍 Hyderabad Environmental Intelligence Dashboard")
-st.markdown("A unified dashboard for **Heat Mitigation**, **AQI Forecasting**, **Route Recommendation**, and **Zone Clustering**.")
-
 # --- INITIALIZE SESSION STATE ---
 if 'zones' not in st.session_state:
     st.session_state.logs = ["Initializing new session..."]
-    with st.spinner("Fetching live baseline data for Hyderabad..."):
+    with st.spinner("Fetching live baseline data..."):
         aqi, pm25, pm10 = fetch_aqi_from_api(BASELINE_STATION_LAT, BASELINE_STATION_LON)
-        if not aqi or np.isnan(aqi):
-            aqi, pm25, pm10 = 110, 45, 80 # Fallback data
+        if not pd.notna(aqi):
             st.session_state.logs.append("Using fallback baseline data.")
-        else:
-            st.session_state.logs.append("Live baseline data fetched successfully.")
-    st.session_state.update({
-        'baseline_aqi': aqi, 'baseline_pm25': pm25, 'baseline_pm10': pm10,
-        'zones': get_realistic_hyderabad_zones(aqi, 40),
-        'stage': 'INITIAL', 'error': None,
-        'route_result': None,
-        'cluster_result': None
-    })
+            aqi, pm25, pm10 = 110, 45, 80
+        st.session_state.baseline_aqi, st.session_state.baseline_pm25, st.session_state.baseline_pm10 = aqi, pm25, pm10
+    # sensible default baseline temperature (user can adjust via slider)
+    st.session_state.baseline_temp = 29
+    st.session_state.zones = get_realistic_hyderabad_zones(st.session_state.baseline_aqi, st.session_state.baseline_temp)
+    st.session_state.stage = 'INITIAL'
+    st.session_state.error = None
+    st.session_state.route_result = None
+    st.session_state.cluster_result = None
+    st.session_state.is_navigating = False
+    st.session_state.user_location = None
+    st.session_state.user_start_coords = None
 
-tab1, tab2, tab3, tab4 = st.tabs(["🌡️ Heat Mitigation", "💨 AQI Forecast", "🧭 Route Recommendation", "📊 Zone Clustering"])
+# --- UI LAYOUT ---
+st.title("🌍 Hyderabad Environmental Intelligence Dashboard")
+st.markdown("A unified dashboard for AI-powered **Heat Mitigation**, **AQI Forecasting**, **Route Recommendation**, and **Zone Clustering**.")
 
-# --- TAB 1: HEAT MITIGATION ---
+tab1, tab2, tab3, tab4 = st.tabs(["🌡️ Heat Mitigation", "💨 AQI Forecast", "🧭 Route Planner", "📊 Zone Clustering"])
+
 with tab1:
     col1, col2 = st.columns([3, 1])
     with col1:
         st.header("Hyderabad Zone Status")
         st.markdown("Simulated real-time environmental status across key city zones.")
-        
         cols = st.columns(4)
         for i, zone in st.session_state.zones.iterrows():
             with cols[i % 4]:
-                with st.container(border=True):
+                with st.container():
                     temp_color = '#ff4b4b' if zone["temperature"] > 40 else 'inherit'
                     aqi_color = '#ff8c00' if zone["aqi"] > 100 else 'inherit'
                     st.markdown(f"**{zone['name']}** {'🔥' if zone['needs_intervention'] else ''}")
                     st.markdown(f'<span style="color: {temp_color};"><b>Temp:</b> {zone["temperature"]:.1f}°C</span> | <span style="color: {aqi_color};"><b>AQI:</b> {zone["aqi"]}</span>', unsafe_allow_html=True)
                     if zone['mitigation_intensity'] > 0:
-                        st.progress(zone['mitigation_intensity'], f"Intensity: {zone['mitigation_intensity']:.2f}")
-
+                        st.progress(zone['mitigation_intensity'])
+                        st.caption(f"Intensity: {zone['mitigation_intensity']:.2f} — {get_intensity_description(zone['mitigation_intensity'])}")
         st.divider()
         st.subheader("🧠 AI-Generated Mitigation Strategies")
         suggestions = st.session_state.zones[st.session_state.zones['suggestion'] != ""]
         if not suggestions.empty:
             for _, row in suggestions.iterrows():
-                with st.container(border=True):
+                with st.container():
                     img_col, text_col = st.columns([1, 2])
-                    with img_col:
-                        if row['image_url']: st.image(row['image_url'], caption=f"Concept for {row['name']}")
+                    if row['image_url']:
+                        try:
+                            img_col.image(row['image_url'], caption=f"Concept for {row['name']}")
+                        except Exception:
+                            img_col.info('Image not available')
                     with text_col:
                         st.markdown(f"##### 📍 Mitigation Plan for {row['name']}")
                         st.markdown(row['suggestion'], unsafe_allow_html=True)
         else:
             st.info("Run the full simulation to generate AI-powered mitigation strategies for critical zones.")
-
     with col2:
         st.header("Simulation Controls")
-        if st.session_state.error: st.error(st.session_state.error)
+        # Baseline temperature control to keep reported temps realistic
+        new_temp = st.number_input("Baseline Temperature (°C)", min_value=10.0, max_value=45.0, value=float(st.session_state.baseline_temp), step=0.5)
+        if st.button("Apply Baseline Temperature", use_container_width=True):
+            st.session_state.baseline_temp = float(new_temp)
+            st.session_state.zones = get_realistic_hyderabad_zones(st.session_state.baseline_aqi, st.session_state.baseline_temp)
+            st.success(f"Applied baseline temperature: {st.session_state.baseline_temp}°C")
+            st.rerun()
 
-        if st.button("1. Identify Hotspots (DQN)", type="primary", use_container_width=True, disabled=st.session_state.stage != 'INITIAL'):
-            with st.spinner('Simulating DQN...'): run_dqn_simulation(); time.sleep(1)
-            st.session_state.stage = 'DQN_COMPLETE'; st.rerun()
-        if st.button("2. Calculate Intensity (DDPG)", use_container_width=True, disabled=st.session_state.stage != 'DQN_COMPLETE'):
-            with st.spinner('Simulating DDPG...'): run_ddpg_simulation(); time.sleep(1)
-            st.session_state.stage = 'DDPG_COMPLETE'; st.rerun()
+        if st.session_state.error: st.error(st.session_state.error)
+        if st.button("1. Identify Hotspots", use_container_width=True, disabled=st.session_state.stage != 'INITIAL'):
+            run_dqn_simulation(); st.session_state.stage = 'DQN_COMPLETE'; st.rerun()
+        if st.button("2. Calculate Intensity", use_container_width=True, disabled=st.session_state.stage != 'DQN_COMPLETE'):
+            run_ddpg_simulation(); st.session_state.stage = 'DDPG_COMPLETE'; st.rerun()
         if st.button("3. Generate AI Suggestions", use_container_width=True, disabled=st.session_state.stage != 'DDPG_COMPLETE'):
-            with st.spinner("🤖 Contacting Gemini AI..."): run_gemini_suggestions()
+            with st.spinner("🤖 Contacting Gemini AI..."):
+                run_gemini_suggestions()
             st.session_state.stage = 'INTEGRATED_COMPLETE'; st.rerun()
-        
         st.divider()
         if st.button("Reset Scenario", type="secondary", use_container_width=True):
-            st.session_state.zones = get_realistic_hyderabad_zones(st.session_state.baseline_aqi, 40)
-            st.session_state.stage = 'INITIAL'
-            st.session_state.error = None
-            st.session_state.route_result = None
-            st.session_state.cluster_result = None
+            st.session_state.zones = get_realistic_hyderabad_zones(st.session_state.baseline_aqi, st.session_state.baseline_temp)
+            st.session_state.stage = 'INITIAL'; st.session_state.error = None; st.session_state.route_result = None; st.session_state.cluster_result = None
+            st.session_state.user_start_coords = None; st.session_state.user_location = None
             st.rerun()
-        
         with st.expander("Show Simulation Logs"):
+    # Example dummy code display
+            st.code("""
+        def example():
+            print("Hello Hyderabad")
+        """, language="python")
+
+            # Display actual logs
             st.code("\n".join(st.session_state.logs), language="log")
 
-
-# --- TAB 2: AQI FORECAST ---
 with tab2:
     st.header("Live AQI & 7-Day Forecast")
-    st.markdown("📍 Click anywhere on the map to get a location-specific AQI forecast, or use the default baseline station.")
-    
+    st.markdown("📍 Click anywhere on the map to get a location-specific AQI forecast.")
     m = folium.Map(location=[DEFAULT_LAT, DEFAULT_LON], zoom_start=11)
-    folium.Marker(
-        [BASELINE_STATION_LAT, BASELINE_STATION_LON],
-        popup="City-Wide Baseline Station (Sanathnagar)",
-        tooltip="Baseline Station",
-        icon=folium.Icon(color='blue', icon='info-sign')
-    ).add_to(m)
-    
+    folium.Marker([BASELINE_STATION_LAT, BASELINE_STATION_LON], popup="Baseline Station", icon=folium.Icon(color='blue', icon='info-sign')).add_to(m)
     map_data = st_folium(m, height=400, width=700)
 
-    if map_data and map_data["last_clicked"]:
+    if map_data and map_data.get("last_clicked"):
         lat, lon = map_data["last_clicked"]["lat"], map_data["last_clicked"]["lng"]
         st.subheader(f"Forecast for Clicked Location ({lat:.4f}, {lon:.4f})")
-        with st.spinner(f"Fetching live AQI at clicked location..."):
+        with st.spinner("Fetching live AQI..."):
             latest_aqi, latest_pm25, latest_pm10 = fetch_aqi_from_api(lat, lon)
     else:
-        st.subheader(f"Forecast for Baseline Station (Sanathnagar)")
+        st.subheader(f"Forecast for Baseline Station")
         latest_aqi, latest_pm25, latest_pm10 = st.session_state.baseline_aqi, st.session_state.baseline_pm25, st.session_state.baseline_pm10
 
     st.markdown("#### Current Conditions")
-    if not np.isnan(latest_aqi):
+    if pd.notna(latest_aqi):
         rec, color = get_aqi_recommendation(latest_aqi)
-        st.metric(label="Live Air Quality Index (AQI)", value=int(latest_aqi))
+        st.metric(label="Live AQI", value=int(latest_aqi))
         st.markdown(f"**Condition:** <span style='color:{color};'>{rec}</span>", unsafe_allow_html=True)
         c1, c2 = st.columns(2)
-        c1.metric(label="PM2.5", value=f"{latest_pm25} µg/m³" if not np.isnan(latest_pm25) else "N/A")
-        c2.metric(label="PM10", value=f"{latest_pm10} µg/m³" if not np.isnan(latest_pm10) else "N/A")
+        c1.metric(label="PM2.5", value=f"{latest_pm25} µg/m³" if pd.notna(latest_pm25) else "N/A")
+        c2.metric(label="PM10", value=f"{latest_pm10:.1f} µg/m³" if pd.notna(latest_pm10) else "N/A")
     else:
-        st.warning("Live AQI data unavailable for this location. Using historical average for forecast.")
+        st.warning("Live AQI data unavailable for this location.")
 
-    with st.spinner("Generating historical data & creating forecast..."):
+    with st.spinner("Generating forecast..."):
         _, past_aqi = generate_past_aqi(latest_aqi)
-        if latest_aqi and not np.isnan(latest_aqi): past_aqi[-1] = latest_aqi
-        full_forecast = mock_lstm_forecast(past_aqi, steps=168)
-
+        full_forecast = mock_lstm_forecast(past_aqi)
+    
     st.markdown("#### 🔮 Next 7 Days Forecast (Daily Average)")
     daily_avg_forecast = [np.mean(full_forecast[i*24:(i+1)*24]) for i in range(7)]
-    forecast_df = pd.DataFrame({
-        'Day': [(datetime.now() + timedelta(days=i+1)).strftime('%a, %b %d') for i in range(7)],
-        'Average AQI': daily_avg_forecast
-    })
-    
-    fig = px.bar(forecast_df, x='Day', y='Average AQI', title="7-Day Average AQI Forecast",
-                 labels={'Average AQI': 'Forecasted AQI Value'}, text_auto='.2s')
-    fig.update_traces(textposition='outside')
+    forecast_df = pd.DataFrame({'Day': [(datetime.now() + timedelta(days=i+1)).strftime('%a, %b %d') for i in range(7)], 'Average AQI': daily_avg_forecast})
+    forecast_df['Color'] = forecast_df['Average AQI'].apply(lambda aqi: get_aqi_recommendation(aqi)[1])
+
+    fig = px.bar(forecast_df, x='Day', y='Average AQI', title="7-Day Average AQI Forecast", text_auto='.0f', color='Color', color_discrete_map="identity")
+    fig.update_traces(textfont=dict(size=14))
+    fig.update_layout(font=dict(size=16), title_font_size=22, xaxis_tickfont_size=14, yaxis_tickfont_size=14, showlegend=False)
     st.plotly_chart(fig, use_container_width=True)
 
+    st.markdown("""
+        <div style="display: flex; justify-content: center; align-items: center; gap: 20px; flex-wrap: wrap;">
+            <div style="display: flex; align-items: center;"><div style="width: 15px; height: 15px; background-color: #28a745; margin-right: 5px;"></div>Good</div>
+            <div style="display: flex; align-items: center;"><div style="width: 15px; height: 15px; background-color: #ffc107; margin-right: 5px;"></div>Moderate</div>
+            <div style="display: flex; align-items: center;"><div style="width: 15px; height: 15px; background-color: #fd7e14; margin-right: 5px;"></div>Unhealthy (SG)</div>
+            <div style="display: flex; align-items: center;"><div style="width: 15px; height: 15px; background-color: #dc3545; margin-right: 5px;"></div>Unhealthy</div>
+        </div>
+    """, unsafe_allow_html=True)
 
-# --- TAB 3: ROUTE RECOMMENDATION ---
+# with tab3:
+#     st.header("Intelligent Route Recommendation")
+#     st.markdown("Find the safest (lowest pollution & heat) or the shortest route with **real road navigation**.")
+#     zones_df = st.session_state.zones
+#     zone_names = zones_df.set_index('id')['name'].to_dict()
+    
+#     col1, col2, col3 = st.columns([2, 2, 1])
+#     with col1:
+#         # The start selectbox uses session_state.start_loc as default when available
+#         start_name = st.selectbox("Select Start Location", options=list(zone_names.values()), index=list(zone_names.values()).index(st.session_state.get('start_loc', list(zone_names.values())[0])) if st.session_state.get('start_loc') in zone_names.values() else 0, key="start_loc")
+#     with col2:
+#         end_name = st.selectbox("Select End Location", options=list(zone_names.values()), index=len(zone_names)-1, key="end_loc")
+#     with col3:
+#         st.write("") 
+#         if st.button("📍 Use My Location", use_container_width=True):
+#             location = streamlit_geolocation()
+#             if location and location.get('latitude'):
+#                 user_lat, user_lon = location['latitude'], location['longitude']
+#                 distances = zones_df.apply(lambda r: np.hypot(r['lat']-user_lat, r['lon']-user_lon), axis=1)
+#                 nearest_idx = distances.idxmin()
+#                 nearest_zone = zones_df.loc[nearest_idx]
+#                 st.session_state.start_loc = nearest_zone['name']
+#                 st.session_state.user_start_coords = (user_lat, user_lon)
+#                 st.success(f"Start set to nearest zone: {st.session_state.start_loc} (using your exact location for routing)")
+#                 st.rerun()
+#             else:
+#                 st.error("Could not access your location. Ensure you allowed location access in the browser.")
+
+#     def build_waypoints_coords(path_ids, start_coords=None):
+#         coords = []
+#         if start_coords:
+#             coords.append((start_coords[0], start_coords[1]))
+#         for zid in path_ids:
+#             zrow = zones_df[zones_df['id'] == zid]
+#             if not zrow.empty:
+#                 coords.append((zrow['lat'].iloc[0], zrow['lon'].iloc[0]))
+#         return coords
+
+#     if st.button("🗺️ Find Routes", type="primary", use_container_width=True):
+#         if start_name == end_name:
+#             st.error("Start and End locations must be different.")
+#         else:
+#             with st.spinner("Calculating routes and fetching road paths..."):
+#                 # Resolve start_id: if user_start_coords exists, use the nearest zone as start_id
+#                 if st.session_state.get('user_start_coords'):
+#                     user_lat, user_lon = st.session_state.user_start_coords
+#                     distances = zones_df.apply(lambda r: np.hypot(r['lat']-user_lat, r['lon']-user_lon), axis=1)
+#                     start_id = zones_df.loc[distances.idxmin()]['id']
+#                     start_coords = st.session_state.user_start_coords
+#                 else:
+#                     start_id = next(id for id, name in zone_names.items() if name == start_name)
+#                     start_coords = None
+
+#                 end_id = next(id for id, name in zone_names.items() if name == end_name)
+
+#                 safe_waypoints, safe_aqi, safe_temp = find_optimal_route(start_id, end_id, zones_df, 'safest')
+
+#                 safe_path_coords = []
+#                 if safe_waypoints:
+#                     safe_path_coords = get_road_path(ors_client, build_waypoints_coords(safe_waypoints, start_coords=start_coords))
+
+#                 # shortest path (direct) - if user provided a start coord, use it
+#                 if start_coords:
+#                     short_path_coords = get_road_path(ors_client, [start_coords, (zones_df.loc[zones_df['id'] == end_id, 'lat'].iloc[0], zones_df.loc[zones_df['id'] == end_id, 'lon'].iloc[0])])
+#                 else:
+#                     short_path_coords = get_road_path(ors_client, [(zones_df.loc[zones_df['id'] == start_id, 'lat'].iloc[0], zones_df.loc[zones_df['id'] == start_id, 'lon'].iloc[0]), (zones_df.loc[zones_df['id'] == end_id, 'lat'].iloc[0], zones_df.loc[zones_df['id'] == end_id, 'lon'].iloc[0])])
+
+#                 # Calculate metrics for the shortest path (start and end zones)
+#                 if start_coords:
+#                     # approximate by using nearest zone for AQI/temp calculations
+#                     short_path_zones = zones_df[zones_df['id'].isin([start_id, end_id])]
+#                 else:
+#                     short_path_zones = zones_df[zones_df['id'].isin([start_id, end_id])]
+#                 short_aqi = short_path_zones['aqi'].mean()
+#                 short_temp = short_path_zones['temperature'].mean()
+
+#                 st.session_state.route_result = {
+#                     "safe_path_coords": safe_path_coords, "safe_aqi": safe_aqi, "safe_temp": safe_temp, "safe_waypoints": safe_waypoints,
+#                     "short_path_coords": short_path_coords, "short_aqi": short_aqi, "short_temp": short_temp,
+#                     "start_coords": start_coords if start_coords else (zones_df.loc[zones_df['id'] == start_id, 'lat'].iloc[0], zones_df.loc[zones_df['id'] == start_id, 'lon'].iloc[0]),
+#                     "end_coords": (zones_df.loc[zones_df['id'] == end_id, 'lat'].iloc[0], zones_df.loc[zones_df['id'] == end_id, 'lon'].iloc[0]),
+#                     "start_name": start_name, "end_name": end_name
+#                 }
+#                 st.session_state.is_navigating = False
+#                 st.rerun()
+
+#     # Live navigation and map display
+#     if st.session_state.get('route_result'):
+#         res = st.session_state.route_result
+#         map_center = res['start_coords']
+#         m = folium.Map(location=map_center, zoom_start=14)
+#         if res.get("safe_path_coords"):
+#             folium.PolyLine(res["safe_path_coords"], color='green', weight=7, opacity=0.8, tooltip="Safest Route").add_to(m)
+#         if res.get("short_path_coords"):
+#             folium.PolyLine(res["short_path_coords"], color='red', weight=4, opacity=0.7, dash_array='5, 5', tooltip="Shortest Route").add_to(m)
+#         folium.Marker(res['start_coords'], popup=f"START: {res['start_name']}", icon=folium.Icon(color='green', icon='play')).add_to(m)
+#         folium.Marker(res['end_coords'], popup=f"END: {res['end_name']}", icon=folium.Icon(color='red', icon='stop')).add_to(m)
+
+#         if st.session_state.is_navigating:
+#             st.info("Live navigation active — updating your route as your location changes")
+#             # attempt to get new location and re-calculate route using current position
+#             location = streamlit_geolocation()
+#             if location and location.get('latitude'):
+#                 st.session_state.user_location = location
+#                 # recompute route from new location
+#                 user_lat, user_lon = location['latitude'], location['longitude']
+#                 distances = zones_df.apply(lambda r: np.hypot(r['lat']-user_lat, r['lon']-user_lon), axis=1)
+#                 start_id = zones_df.loc[distances.idxmin()]['id']
+#                 safe_waypoints, safe_aqi, safe_temp = find_optimal_route(start_id, end_id, zones_df, 'safest')
+#                 new_safe_coords = get_road_path(ors_client, build_waypoints_coords(safe_waypoints, start_coords=(user_lat, user_lon))) if safe_waypoints else []
+#                 new_short_coords = get_road_path(ors_client, [(user_lat, user_lon), res['end_coords']])
+#                 st.session_state.route_result.update({
+#                     'safe_path_coords': new_safe_coords,
+#                     'short_path_coords': new_short_coords,
+#                     'safe_aqi': safe_aqi,
+#                     'safe_temp': safe_temp,
+#                     'start_coords': (user_lat, user_lon)
+#                 })
+#                 # re-render map with updated route
+#                 m = folium.Map(location=(user_lat, user_lon), zoom_start=15)
+#                 if new_safe_coords:
+#                     folium.PolyLine(new_safe_coords, color='green', weight=7, opacity=0.8, tooltip="Safest Route").add_to(m)
+#                 if new_short_coords:
+#                     folium.PolyLine(new_short_coords, color='red', weight=4, opacity=0.7, dash_array='5, 5', tooltip="Shortest Route").add_to(m)
+#                 folium.Marker((user_lat, user_lon), popup="You (live)", icon=folium.Icon(color='blue', icon='user')).add_to(m)
+#                 folium.Marker(res['end_coords'], popup=f"END: {res['end_name']}", icon=folium.Icon(color='red', icon='stop')).add_to(m)
+#             else:
+#                 st.warning("Unable to get live location updates. Check browser permissions.")
+
+#         st_folium(m, height=450, width=700, returned_objects=[])
+
+#         res_col1, res_col2 = st.columns(2)
+#         with res_col1:
+#             st.markdown("##### 🏆 Safest Route (Recommended)")
+#             st.caption(' → '.join([zone_names.get(zid, "") for zid in res.get('safe_waypoints', [])]))
+#             if res.get('safe_aqi') is not None:
+#                 st.metric("Avg AQI / Temp", f"{res['safe_aqi']:.1f} / {res['safe_temp']:.1f}°C")
+#         with res_col2:
+#             st.markdown("##### 📏 Standard Shortest Route")
+#             st.caption(f"{res['start_name']} → {res['end_name']} (Direct)")
+#             st.metric("Avg AQI / Temp", f"{res['short_aqi']:.1f} / {res['short_temp']:.1f}°C")
+#         st.divider()
+
+#         nav_col1, nav_col2 = st.columns(2)
+#         with nav_col1:
+#             if not st.session_state.is_navigating:
+#                 if st.button("▶️ Start Navigation", use_container_width=True, type="primary"):
+#                     st.session_state.is_navigating = True; st.rerun()
+#             else:
+#                 if st.button("⏹️ Stop Navigation", use_container_width=True):
+#                     st.session_state.is_navigating = False; st.session_state.user_location = None; st.rerun()
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+from streamlit_js_eval import get_geolocation
+import numpy as np
+import folium
+from streamlit_folium import st_folium
+
 with tab3:
-    st.header("Intelligent Route Recommendation")
-    st.markdown("Find the safest (lowest pollution & heat exposure) or the shortest route between two zones.")
+    st.header("🧭 Intelligent Route Planner")
+    st.markdown("Find the safest (lowest pollution & heat) or the shortest route with **real road navigation** and live updates.")
+
     zones_df = st.session_state.zones
     zone_names = zones_df.set_index('id')['name'].to_dict()
-    
-    col1, col2 = st.columns(2)
-    start_name = col1.selectbox("Select Start Location", options=zone_names.values(), index=0, key="start_loc")
-    end_name = col2.selectbox("Select End Location", options=zone_names.values(), index=len(zone_names)-1, key="end_loc")
-    
-    if st.button("Find Routes", type="primary", use_container_width=True):
+
+    # -------------------------------
+    #  UI LAYOUT: Start / End / Use My Location
+    # -------------------------------
+    col1, col2, col3 = st.columns([2, 2, 1])
+    with col1:
+        default_start = st.session_state.get('start_loc', list(zone_names.values())[0])
+        start_name = st.selectbox(
+            "Select Start Location",
+            options=list(zone_names.values()),
+            index=list(zone_names.values()).index(default_start) if default_start in zone_names.values() else 0,
+            key="start_loc"
+        )
+    with col2:
+        end_name = st.selectbox(
+            "Select End Location",
+            options=list(zone_names.values()),
+            index=len(zone_names) - 1,
+            key="end_loc"
+        )
+    with col3:
+        st.write("")  # spacing
+        if st.button("📍 Use My Location", use_container_width=True):
+            # Request browser location
+            location = streamlit_js_eval(js_expressions="await new Promise(resolve => navigator.geolocation.getCurrentPosition(p => resolve({latitude: p.coords.latitude, longitude: p.coords.longitude})))", key="get_location")
+
+            if location and location.get('latitude'):
+                user_lat, user_lon = location['latitude'], location['longitude']
+                distances = zones_df.apply(lambda r: np.hypot(r['lat'] - user_lat, r['lon'] - user_lon), axis=1)
+                nearest_idx = distances.idxmin()
+                nearest_zone = zones_df.loc[nearest_idx]
+                st.session_state.start_loc = nearest_zone['name']
+                st.session_state.user_start_coords = (user_lat, user_lon)
+                st.success(f"📍 Start set to nearest zone: {st.session_state.start_loc} (using your exact GPS location)")
+                st.session_state.route_result = None
+                st.rerun()
+            else:
+                st.error("Could not access your location. Enable location permission in your browser and try again.")
+
+    # -------------------------------
+    #  HELPER FUNCTION
+    # -------------------------------
+    def build_waypoints_coords(path_ids, start_coords=None):
+        coords = []
+        if start_coords:
+            coords.append((start_coords[0], start_coords[1]))
+        for zid in path_ids:
+            zrow = zones_df[zones_df['id'] == zid]
+            if not zrow.empty:
+                coords.append((zrow['lat'].iloc[0], zrow['lon'].iloc[0]))
+        return coords
+
+    # -------------------------------
+    #  ROUTE MODE TOGGLE
+    # -------------------------------
+    route_mode = st.radio(
+        "Select Route Mode",
+        ["Safest Route", "Shortest Route", "Show Both"],
+        horizontal=True,
+        index=0
+    )
+
+    # -------------------------------
+    #  BUTTON: FIND ROUTE
+    # -------------------------------
+    if st.button("🗺️ Find Route", type="primary", use_container_width=True):
         if start_name == end_name:
-            st.error("Start and End locations cannot be the same.")
+            st.error("Start and End locations must be different.")
         else:
-            with st.spinner("Calculating safest and shortest routes..."):
-                start_id = next((id for id, name in zone_names.items() if name == start_name), None)
-                end_id = next((id for id, name in zone_names.items() if name == end_name), None)
-                safe_path, safe_aqi, safe_temp = find_optimal_route(start_id, end_id, zones_df, 'safest')
-                short_path, short_aqi, short_temp = find_optimal_route(start_id, end_id, zones_df, 'shortest')
+            with st.spinner("Calculating routes..."):
+                start_coords = st.session_state.get('user_start_coords', None)
+                if start_coords:
+                    user_lat, user_lon = start_coords
+                    distances = zones_df.apply(lambda r: np.hypot(r['lat'] - user_lat, r['lon'] - user_lon), axis=1)
+                    start_id = zones_df.loc[distances.idxmin()]['id']
+                else:
+                    start_id = next(id for id, name in zone_names.items() if name == start_name)
+
+                end_id = next(id for id, name in zone_names.items() if name == end_name)
+
+                # SAFEST ROUTE
+                safe_waypoints, safe_aqi, safe_temp = find_optimal_route(start_id, end_id, zones_df, 'safest')
+                safe_path_coords = get_road_path(
+                    ors_client,
+                    build_waypoints_coords(safe_waypoints, start_coords=start_coords)
+                ) if safe_waypoints else []
+
+                # SHORTEST ROUTE
+                if start_coords:
+                    short_path_coords = get_road_path(ors_client, [start_coords, (
+                        zones_df.loc[zones_df['id'] == end_id, 'lat'].iloc[0],
+                        zones_df.loc[zones_df['id'] == end_id, 'lon'].iloc[0]
+                    )])
+                else:
+                    short_path_coords = get_road_path(ors_client, [
+                        (zones_df.loc[zones_df['id'] == start_id, 'lat'].iloc[0],
+                         zones_df.loc[zones_df['id'] == start_id, 'lon'].iloc[0]),
+                        (zones_df.loc[zones_df['id'] == end_id, 'lat'].iloc[0],
+                         zones_df.loc[zones_df['id'] == end_id, 'lon'].iloc[0])
+                    ])
+
+                # Metrics for shortest route
+                short_zones = zones_df[zones_df['id'].isin([start_id, end_id])]
+                short_aqi = short_zones['aqi'].mean()
+                short_temp = short_zones['temperature'].mean()
+
                 st.session_state.route_result = {
-                    "safe_path": safe_path, "safe_aqi": safe_aqi, "safe_temp": safe_temp,
-                    "short_path": short_path, "short_aqi": short_aqi, "short_temp": short_temp,
-                    "start_id": start_id, "end_id": end_id
+                    "mode": route_mode,
+                    "safe_path_coords": safe_path_coords,
+                    "safe_aqi": safe_aqi,
+                    "safe_temp": safe_temp,
+                    "safe_waypoints": safe_waypoints,
+                    "short_path_coords": short_path_coords,
+                    "short_aqi": short_aqi,
+                    "short_temp": short_temp,
+                    "start_coords": start_coords if start_coords else (zones_df.loc[zones_df['id'] == start_id, 'lat'].iloc[0], zones_df.loc[zones_df['id'] == start_id, 'lon'].iloc[0]),
+                    "end_coords": (zones_df.loc[zones_df['id'] == end_id, 'lat'].iloc[0], zones_df.loc[zones_df['id'] == end_id, 'lon'].iloc[0]),
+                    "start_name": start_name,
+                    "end_name": end_name
                 }
+                st.session_state.is_navigating = False
+                st.rerun()
 
-    if st.session_state.get('route_result'):
+    # -------------------------------
+    #  MAP DISPLAY & NAVIGATION
+    # -------------------------------
+    if st.session_state.get("route_result"):
         res = st.session_state.route_result
-        st.subheader("Route Visualization")
-        route_map = folium.Map(location=[DEFAULT_LAT, DEFAULT_LON], zoom_start=11)
+        m = folium.Map(location=res["start_coords"], zoom_start=13)
 
-        def get_coords(path):
-            return [(zones_df.loc[zones_df['id'] == zid, 'lat'].iloc[0], zones_df.loc[zones_df['id'] == zid, 'lon'].iloc[0]) for zid in path]
+        # Add routes based on selected mode
+        if res["mode"] in ["Safest Route", "Show Both"] and res.get("safe_path_coords"):
+            folium.PolyLine(res["safe_path_coords"], color='green', weight=7, opacity=0.8, tooltip="Safest Route").add_to(m)
+        if res["mode"] in ["Shortest Route", "Show Both"] and res.get("short_path_coords"):
+            folium.PolyLine(res["short_path_coords"], color='blue', weight=4, opacity=0.7, dash_array='5,5', tooltip="Shortest Route").add_to(m)
 
-        if res["safe_path"]:
-            folium.PolyLine(get_coords(res["safe_path"]), color='green', weight=6, opacity=0.8, tooltip="Safest Route").add_to(route_map)
-        if res["short_path"]:
-            folium.PolyLine(get_coords(res["short_path"]), color='red', weight=3, opacity=0.8, dash_array='5, 5', tooltip="Shortest Route").add_to(route_map)
-        
-        start_zone = zones_df.loc[zones_df['id'] == res["start_id"]].iloc[0]
-        end_zone = zones_df.loc[zones_df['id'] == res["end_id"]].iloc[0]
-        folium.Marker([start_zone['lat'], start_zone['lon']], popup=f"START: {start_zone['name']}", icon=folium.Icon(color='green', icon='play')).add_to(route_map)
-        folium.Marker([end_zone['lat'], end_zone['lon']], popup=f"END: {end_zone['name']}", icon=folium.Icon(color='red', icon='stop')).add_to(route_map)
-        
-        st_folium(route_map, height=450, width=700)
-        
-        res_col1, res_col2 = st.columns(2)
-        with res_col1:
-            st.markdown("##### 🏆 Safest Route (Recommended)")
-            if res["safe_path"]:
-                st.markdown(f"**Path:** {' → '.join([zone_names[zid] for zid in res['safe_path']])}")
-                c1, c2 = st.columns(2); c1.metric("Avg AQI Exposure", f"{res['safe_aqi']:.1f}"); c2.metric("Avg Temp", f"{res['safe_temp']:.1f}°C")
-            else: st.warning("No safe route found.")
-        with res_col2:
-            st.markdown("##### 📏 Standard Shortest Route")
-            if res["short_path"]:
-                st.markdown(f"**Path:** {' → '.join([zone_names[zid] for zid in res['short_path']])}")
-                c1, c2 = st.columns(2); c1.metric("Avg AQI Exposure", f"{res['short_aqi']:.1f}"); c2.metric("Avg Temp", f"{res['short_temp']:.1f}°C")
-            else: st.warning("No shortest route found.")
-        
-        if res["safe_path"] and res["short_path"] and res["safe_aqi"] < res["short_aqi"]:
-            improvement = ((res["short_aqi"] - res["safe_aqi"]) / res["short_aqi"]) * 100
-            st.success(f"By choosing the safest route, you can reduce pollution exposure by **{improvement:.0f}%**!")
+        folium.Marker(res['start_coords'], popup=f"START: {res['start_name']}", icon=folium.Icon(color='green', icon='play')).add_to(m)
+        folium.Marker(res['end_coords'], popup=f"END: {res['end_name']}", icon=folium.Icon(color='red', icon='flag')).add_to(m)
 
-# --- TAB 4: ZONE CLUSTERING ---
+        st_folium(m, height=500, width=900, returned_objects=[])
+
+        # Display metrics
+        st.divider()
+        col1, col2 = st.columns(2)
+        if res["mode"] in ["Safest Route", "Show Both"]:
+            with col1:
+                st.markdown("### 🏆 Safest Route (Recommended)")
+                st.metric("Avg AQI / Temp", f"{res['safe_aqi']:.1f} / {res['safe_temp']:.1f}°C")
+        if res["mode"] in ["Shortest Route", "Show Both"]:
+            with col2:
+                st.markdown("### 📏 Shortest Route")
+                st.metric("Avg AQI / Temp", f"{res['short_aqi']:.1f} / {res['short_temp']:.1f}°C")
+
+        # -------------------------------
+        #  NAVIGATION CONTROLS
+        # -------------------------------
+        st.divider()
+        nav_col1, nav_col2 = st.columns(2)
+        with nav_col1:
+            if not st.session_state.is_navigating:
+                if st.button("▶️ Start Navigation", use_container_width=True, type="primary"):
+                    st.session_state.is_navigating = True
+                    st.session_state.user_location = {'latitude': res['start_coords'][0], 'longitude': res['start_coords'][1]}
+                    st.rerun()
+            else:
+                if st.button("⏹️ Stop Navigation", use_container_width=True):
+                    st.session_state.is_navigating = False
+                    st.success("Navigation stopped.")
+                    st.rerun()
+
+        # -------------------------------
+        #  LIVE UPDATES EVERY 10s
+        # -------------------------------
+        if st.session_state.get('is_navigating', False):
+            try:
+                location = streamlit_js_eval(js_expressions="await new Promise(resolve => navigator.geolocation.getCurrentPosition(p => resolve({latitude: p.coords.latitude, longitude: p.coords.longitude})))", key="live_location")
+            except Exception:
+                location = None
+
+            if location and location.get('latitude'):
+                user_lat, user_lon = location['latitude'], location['longitude']
+                st.session_state.user_location = {'latitude': user_lat, 'longitude': user_lon}
+
+                distances = zones_df.apply(lambda r: np.hypot(r['lat'] - user_lat, r['lon'] - user_lon), axis=1)
+                start_id_live = zones_df.loc[distances.idxmin()]['id']
+                end_name = res['end_name']
+                end_id_live = next(id for id, name in zone_names.items() if name == end_name)
+
+                safe_waypoints_live, safe_aqi_live, safe_temp_live = find_optimal_route(start_id_live, end_id_live, zones_df, 'safest')
+                new_safe_coords = get_road_path(ors_client, build_waypoints_coords(safe_waypoints_live, start_coords=(user_lat, user_lon)))
+                new_short_coords = get_road_path(ors_client, [(user_lat, user_lon), res['end_coords']])
+
+                # Update route results
+                st.session_state.route_result.update({
+                    'safe_path_coords': new_safe_coords,
+                    'short_path_coords': new_short_coords,
+                    'safe_aqi': safe_aqi_live,
+                    'safe_temp': safe_temp_live,
+                    'start_coords': (user_lat, user_lon)
+                })
+
+                st.info("Live navigation active — route updated every 10 seconds.")
+                time.sleep(10)
+                st.rerun()
+            else:
+                st.warning("Unable to get live location updates. Check browser permissions.")
+
+
+
+
+
+
+# with tab4:
+#     st.header("Dynamic Zone Clustering (DBSCAN)")
+#     if st.button("Run Clustering Analysis", type="primary", use_container_width=True):
+#         with st.spinner("Analyzing and clustering zone data..."):
+#             df_copy = st.session_state.zones.copy()
+#             features = StandardScaler().fit_transform(df_copy[['temperature', 'aqi']])
+#             dbscan = DBSCAN(eps=0.7, min_samples=2).fit(features)
+#             df_copy['cluster'] = dbscan.labels_
+#             st.session_state.cluster_result = df_copy
+#     if st.session_state.get('cluster_result') is not None:
+#         clustered_df = st.session_state.cluster_result
+#         cluster_labels = {cid: get_cluster_label(clustered_df, cid) for cid in clustered_df['cluster'].unique()}
+#         clustered_df['cluster_label'] = clustered_df['cluster'].map(cluster_labels)
+        
+#         st.subheader("Interactive Cluster Plot")
+#         fig = px.scatter(clustered_df, x='aqi', y='temperature', color='cluster_label', hover_name='name', title="Zone Clusters by Temperature and AQI")
+#         st.plotly_chart(fig, use_container_width=True)
+
+#         st.subheader("Geospatial Cluster Visualization")
+#         cluster_map = folium.Map(location=[DEFAULT_LAT, DEFAULT_LON], zoom_start=11)
+#         color_map = {-1: 'gray', 0: 'blue', 1: 'green', 2: 'purple', 3: 'orange', 4: 'red'}
+#         for _, zone in clustered_df.iterrows():
+#             cluster_id = zone['cluster']
+#             color = color_map.get(cluster_id, 'black')
+#             popup_html = f"<strong>{zone['name']}</strong><br>Cluster: {zone['cluster_label']}<br>Temp: {zone['temperature']:.1f}°C<br>AQI: {zone['aqi']}"
+#             folium.CircleMarker(location=[zone['lat'], zone['lon']], radius=7, color=color, fill=True, fill_color=color, popup=folium.Popup(popup_html, max_width=250)).add_to(cluster_map)
+#             # Add a small label next to the marker with the cluster_label
+#             folium.map.Marker([zone['lat'] + 0.001, zone['lon'] + 0.001], icon=DivIcon(html=f"<div style='font-size:11px;color:{color};font-weight:bold'>{zone['cluster_label']}</div>" )).add_to(cluster_map)
+#         st_folium(cluster_map, height=450, width=700)
+
+
+
+
+
+
+
+
+
+
+
+
+
 with tab4:
-    st.header("Dynamic Zone Clustering (DBSCAN)")
-    st.markdown("This analysis uses unsupervised learning to group zones with similar environmental conditions.")
-    
+    st.header("🌐 Dynamic Zone Clustering (DBSCAN)")
+
     if st.button("Run Clustering Analysis", type="primary", use_container_width=True):
         with st.spinner("Analyzing and clustering zone data..."):
-            zones_df_copy = st.session_state.zones.copy()
-            features = zones_df_copy[['temperature', 'aqi']]
-            scaled_features = StandardScaler().fit_transform(features)
-            dbscan = DBSCAN(eps=0.7, min_samples=2)
-            zones_df_copy['cluster'] = dbscan.fit_predict(scaled_features)
-            st.session_state.cluster_result = zones_df_copy
-    
+            df_copy = st.session_state.zones.copy()
+
+            # Normalize features for DBSCAN
+            scaler = StandardScaler()
+            features = scaler.fit_transform(df_copy[['temperature', 'aqi']])
+
+            # Perform DBSCAN clustering
+            dbscan = DBSCAN(eps=0.75, min_samples=2).fit(features)
+            df_copy['cluster'] = dbscan.labels_
+
+            # Compute descriptive cluster labels
+            def get_cluster_label(df, cid):
+                if cid == -1:
+                    return "Noise / Outlier Zone"
+                sub = df[df['cluster'] == cid]
+                avg_temp = sub['temperature'].mean()
+                avg_aqi = sub['aqi'].mean()
+                if avg_temp > 35 and avg_aqi > 150:
+                    return "🔥 High Heat & High Pollution"
+                elif avg_temp > 35 and avg_aqi <= 150:
+                    return "☀️ Hot but Cleaner Air"
+                elif avg_temp <= 35 and avg_aqi > 150:
+                    return "🌫️ Cool but Polluted"
+                else:
+                    return "🌿 Cool & Clean Zone"
+
+            cluster_labels = {
+                cid: get_cluster_label(df_copy, cid)
+                for cid in df_copy['cluster'].unique()
+            }
+            df_copy['cluster_label'] = df_copy['cluster'].map(cluster_labels)
+
+            # Save results + labels persistently
+            st.session_state.cluster_result = df_copy
+            st.session_state.cluster_labels = cluster_labels
+
+    # --- Display if clustering has been run ---
     if st.session_state.get('cluster_result') is not None:
         clustered_df = st.session_state.cluster_result
-        st.subheader("Interactive Cluster Plot")
+        cluster_labels = st.session_state.get('cluster_labels', {})
+
+        st.subheader("📊 Cluster Summary")
+        summary_df = (
+            clustered_df.groupby('cluster_label')
+            .agg({'temperature': 'mean', 'aqi': 'mean', 'id': 'count'})
+            .rename(columns={'id': 'zone_count', 'temperature': 'avg_temp', 'aqi': 'avg_aqi'})
+            .reset_index()
+        )
+        st.dataframe(summary_df.style.background_gradient(cmap='coolwarm', subset=['avg_aqi', 'avg_temp']))
+
+        # --- Plotly Visualization ---
+        st.subheader("🧩 Cluster Distribution (AQI vs Temperature)")
         fig = px.scatter(
-            clustered_df, x='aqi', y='temperature', color='cluster',
-            color_continuous_scale=px.colors.qualitative.Vivid,
-            hover_name='name', labels={'cluster': 'Cluster ID'},
-            title="Zone Clusters by Temperature and AQI"
+            clustered_df,
+            x='aqi',
+            y='temperature',
+            color='cluster_label',
+            hover_name='name',
+            hover_data={'lat': False, 'lon': False},
+            title="Zone Clusters by Temperature and AQI",
+            labels={'aqi': 'Air Quality Index', 'temperature': 'Temperature (°C)'},
         )
         fig.update_traces(marker=dict(size=12, line=dict(width=1, color='DarkSlateGrey')))
+        fig.update_layout(legend_title_text='Cluster Label', template='plotly_white')
         st.plotly_chart(fig, use_container_width=True)
 
-        st.subheader("Geospatial Cluster Visualization")
-        cluster_map = folium.Map(location=[DEFAULT_LAT, DEFAULT_LON], zoom_start=11)
-        color_map = {-1: 'gray', 0: 'blue', 1: 'green', 2: 'purple', 3: 'orange', 4: 'red'}
+        # --- Folium Map Visualization ---
+        st.subheader("🗺️ Geospatial Cluster Visualization")
+
+        cluster_map = folium.Map(location=[DEFAULT_LAT, DEFAULT_LON], zoom_start=11, tiles="cartodb positron")
+        marker_cluster = folium.plugins.MarkerCluster().add_to(cluster_map)
+
+        color_palette = [
+            "red", "green", "blue", "purple", "orange", "darkred",
+            "cadetblue", "darkgreen", "lightgray", "black"
+        ]
+        color_map = {
+            cid: color_palette[i % len(color_palette)]
+            for i, cid in enumerate(sorted(clustered_df['cluster'].unique()))
+        }
+
         for _, zone in clustered_df.iterrows():
             cluster_id = zone['cluster']
-            color = color_map.get(cluster_id, 'black')
-            folium.Marker(
+            color = color_map.get(cluster_id, 'gray')
+            popup_html = f"""
+                <strong>{zone['name']}</strong><br>
+                <b>Cluster:</b> {zone['cluster_label']}<br>
+                🌡️ <b>Temp:</b> {zone['temperature']:.1f}°C<br>
+                🏭 <b>AQI:</b> {zone['aqi']}
+            """
+            folium.CircleMarker(
                 location=[zone['lat'], zone['lon']],
-                popup=f"<strong>{zone['name']}</strong><br>Cluster: {'Outlier' if cluster_id == -1 else cluster_id}",
-                tooltip=zone['name'],
-                icon=folium.Icon(color=color)
-            ).add_to(cluster_map)
-        st_folium(cluster_map, height=450, width=700)
+                radius=8,
+                color=color,
+                fill=True,
+                fill_color=color,
+                popup=folium.Popup(popup_html, max_width=300),
+            ).add_to(marker_cluster)
 
-        st.subheader("Cluster Groups")
-        for cluster_id in sorted(clustered_df['cluster'].unique()):
-            cluster_zones = clustered_df[clustered_df['cluster'] == cluster_id]['name'].tolist()
-            if cluster_id == -1:
-                st.markdown(f"**⚪ Outliers (Unique Conditions):** {', '.join(cluster_zones)}")
-            else:
-                st.markdown(f"**🔵 Cluster {cluster_id} (Similar Conditions):** {', '.join(cluster_zones)}")
+        # --- Legend ---
+        if cluster_labels:
+            legend_html = """
+            <div style="position: fixed; bottom: 50px; left: 50px; width: 240px;
+                        background-color: white; border-radius: 8px; padding: 10px; 
+                        box-shadow: 0 0 8px rgba(0,0,0,0.3); font-size: 13px;">
+                <b>🗂️ Cluster Legend</b><br>
+            """
+            for cid, label in cluster_labels.items():
+                color = color_map.get(cid, 'gray')
+                legend_html += f'<div><i style="background:{color};width:12px;height:12px;display:inline-block;border-radius:50%;margin-right:6px;"></i>{label}</div>'
+            legend_html += "</div>"
+            cluster_map.get_root().html.add_child(folium.Element(legend_html))
+
+        st_folium(cluster_map, height=500, width=750)
