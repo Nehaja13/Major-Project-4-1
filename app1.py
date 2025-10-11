@@ -1114,110 +1114,488 @@ from streamlit_folium import st_folium
 
 from streamlit_geolocation import streamlit_geolocation
 
+# with tab3:
+#     st.header("🧭 Intelligent Route Planner")
+#     st.markdown("Find the safest (lowest pollution & heat) or the shortest route with **real road navigation** and live updates.")
+
+#     zones_df = st.session_state.zones
+#     zone_names = zones_df.set_index('id')['name'].to_dict()
+
+#     # -------------------------------
+#     #  UI LAYOUT: Start / End / Use My Location
+#     # -------------------------------
+#     col1, col2, col3 = st.columns([2, 2, 1])
+#     with col1:
+#         default_start = st.session_state.get('start_loc', list(zone_names.values())[0])
+#         start_name = st.selectbox(
+#             "Select Start Location",
+#             options=list(zone_names.values()),
+#             index=list(zone_names.values()).index(default_start) if default_start in zone_names.values() else 0,
+#             key="start_loc"
+#         )
+#     with col2:
+#         end_name = st.selectbox(
+#             "Select End Location",
+#             options=list(zone_names.values()),
+#             index=len(zone_names) - 1,
+#             key="end_loc"
+#         )
+
+#     with col3:
+#         st.write("")  # spacing
+#         if st.button("📍 Use My Location", use_container_width=True):
+#             location = streamlit_geolocation()
+#             if location and location.get('latitude') and location.get('longitude'):
+#                 user_lat, user_lon = location['latitude'], location['longitude']
+
+#                 # Find nearest zone to current GPS location
+#                 distances = zones_df.apply(
+#                     lambda r: np.hypot(r["lat"] - user_lat, r["lon"] - user_lon), axis=1
+#                 )
+#                 nearest_idx = distances.idxmin()
+#                 nearest_zone = zones_df.loc[nearest_idx]
+
+#                 st.session_state.start_loc = nearest_zone["name"]
+#                 st.session_state.user_start_coords = (user_lat, user_lon)
+#                 st.success(f"📍 Start set to nearest zone: {st.session_state.start_loc} (GPS: {user_lat:.4f}, {user_lon:.4f})")
+#                 st.session_state.route_result = None
+#                 st.rerun()
+#             else:
+#                 st.warning("⚠️ Please allow location access in your browser to use this feature.")
+
+#     # -------------------------------
+#     #  ROUTE MODE TOGGLE
+#     # -------------------------------
+#     route_mode = st.radio(
+#         "Select Route Mode",
+#         ["Safest Route", "Shortest Route", "Show Both"],
+#         horizontal=True,
+#         index=0
+#     )
+
+#     # -------------------------------
+#     #  BUTTON: FIND ROUTE
+#     # -------------------------------
+#     if st.button("🗺️ Find Route", type="primary", use_container_width=True):
+#         if start_name == end_name:
+#             st.error("Start and End locations must be different.")
+#         else:
+#             with st.spinner("Calculating routes..."):
+#                 start_coords = st.session_state.get("user_start_coords", None)
+#                 if start_coords:
+#                     user_lat, user_lon = start_coords
+#                     distances = zones_df.apply(lambda r: np.hypot(r["lat"] - user_lat, r["lon"] - user_lon), axis=1)
+#                     start_id = zones_df.loc[distances.idxmin()]["id"]
+#                 else:
+#                     start_id = next(id for id, name in zone_names.items() if name == start_name)
+
+#                 end_id = next(id for id, name in zone_names.items() if name == end_name)
+
+#                 # SAFEST ROUTE
+#                 safe_waypoints, safe_aqi, safe_temp = find_optimal_route(start_id, end_id, zones_df, "safest")
+#                 safe_path_coords = get_road_path(
+#                     ors_client,
+#                     [(zones_df.loc[zones_df["id"] == w, "lat"].iloc[0],
+#                       zones_df.loc[zones_df["id"] == w, "lon"].iloc[0]) for w in safe_waypoints]
+#                 ) if safe_waypoints else []
+
+#                 # SHORTEST ROUTE
+#                 if start_coords:
+#                     short_path_coords = get_road_path(ors_client, [
+#                         start_coords,
+#                         (zones_df.loc[zones_df["id"] == end_id, "lat"].iloc[0],
+#                          zones_df.loc[zones_df["id"] == end_id, "lon"].iloc[0])
+#                     ])
+#                 else:
+#                     short_path_coords = get_road_path(ors_client, [
+#                         (zones_df.loc[zones_df["id"] == start_id, "lat"].iloc[0],
+#                          zones_df.loc[zones_df["id"] == start_id, "lon"].iloc[0]),
+#                         (zones_df.loc[zones_df["id"] == end_id, "lat"].iloc[0],
+#                          zones_df.loc[zones_df["id"] == end_id, "lon"].iloc[0])
+#                     ])
+
+#                 short_zones = zones_df[zones_df["id"].isin([start_id, end_id])]
+#                 short_aqi = short_zones["aqi"].mean()
+#                 short_temp = short_zones["temperature"].mean()
+
+#                 st.session_state.route_result = {
+#                     "mode": route_mode,
+#                     "safe_path_coords": safe_path_coords,
+#                     "safe_aqi": safe_aqi,
+#                     "safe_temp": safe_temp,
+#                     "short_path_coords": short_path_coords,
+#                     "short_aqi": short_aqi,
+#                     "short_temp": short_temp,
+#                     "start_coords": start_coords if start_coords else (
+#                         zones_df.loc[zones_df["id"] == start_id, "lat"].iloc[0],
+#                         zones_df.loc[zones_df["id"] == start_id, "lon"].iloc[0]
+#                     ),
+#                     "end_coords": (
+#                         zones_df.loc[zones_df["id"] == end_id, "lat"].iloc[0],
+#                         zones_df.loc[zones_df["id"] == end_id, "lon"].iloc[0]
+#                     ),
+#                     "start_name": start_name,
+#                     "end_name": end_name
+#                 }
+#                 st.session_state.is_navigating = False
+#                 st.rerun()
+
+#     # -------------------------------
+#     #  MAP DISPLAY
+#     # -------------------------------
+#     if st.session_state.get("route_result"):
+#         res = st.session_state.route_result
+#         m = folium.Map(location=res["start_coords"], zoom_start=13)
+
+#         if res["mode"] in ["Safest Route", "Show Both"] and res.get("safe_path_coords"):
+#             folium.PolyLine(res["safe_path_coords"], color="green", weight=7, opacity=0.8, tooltip="Safest Route").add_to(m)
+#         if res["mode"] in ["Shortest Route", "Show Both"] and res.get("short_path_coords"):
+#             folium.PolyLine(res["short_path_coords"], color="blue", weight=4, opacity=0.7, dash_array="5,5", tooltip="Shortest Route").add_to(m)
+
+#         folium.Marker(res["start_coords"], popup=f"START: {res['start_name']}", icon=folium.Icon(color="green", icon="play")).add_to(m)
+#         folium.Marker(res["end_coords"], popup=f"END: {res['end_name']}", icon=folium.Icon(color="red", icon="flag")).add_to(m)
+
+#         st_folium(m, height=500, width=900, returned_objects=[])
+
+#         st.divider()
+#         col1, col2 = st.columns(2)
+#         if res["mode"] in ["Safest Route", "Show Both"]:
+#             with col1:
+#                 st.markdown("### 🏆 Safest Route (Recommended)")
+#                 st.metric("Avg AQI / Temp", f"{res['safe_aqi']:.1f} / {res['safe_temp']:.1f}°C")
+#         if res["mode"] in ["Shortest Route", "Show Both"]:
+#             with col2:
+#                 st.markdown("### 📏 Shortest Route")
+#                 st.metric("Avg AQI / Temp", f"{res['short_aqi']:.1f} / {res['short_temp']:.1f}°C")
+
+
+
+
+
+
+
+
+
+
+# TAB 3: Intelligent Route Planner (complete, with live tracking)
+from streamlit_geolocation import streamlit_geolocation
+from streamlit_folium import st_folium
+import folium
+import openrouteservice
+from streamlit_autorefresh import st_autorefresh  # pip install streamlit-autorefresh
+
+# with tab3:
+#     st.header("🧭 Intelligent Route Planner")
+#     st.markdown("Find the safest (lowest pollution & heat) or the shortest route with **real road navigation** and live updates.")
+
+#     zones_df = st.session_state.zones
+#     zone_names = zones_df.set_index('id')['name'].to_dict()
+
+#     # Layout: Start / End / Use My Location
+#     col1, col2, col3 = st.columns([2, 2, 1])
+#     with col1:
+#         default_start = st.session_state.get('start_loc', list(zone_names.values())[0])
+#         start_name = st.selectbox(
+#             "Select Start Location",
+#             options=list(zone_names.values()),
+#             index=list(zone_names.values()).index(default_start) if default_start in zone_names.values() else 0,
+#             key="start_loc"
+#         )
+#     with col2:
+#         end_name = st.selectbox(
+#             "Select End Location",
+#             options=list(zone_names.values()),
+#             index=len(zone_names) - 1,
+#             key="end_loc"
+#         )
+
+#     with col3:
+#         st.write("")  # spacing
+#         if st.button("📍 Use My Location", use_container_width=True):
+#             # Ask browser for permission and return coordinates
+#             loc = streamlit_geolocation()
+#             if loc and loc.get("latitude") and loc.get("longitude"):
+#                 user_lat, user_lon = loc["latitude"], loc["longitude"]
+
+#                 # store raw coords in session and compute nearest zone
+#                 st.session_state.user_start_coords = (user_lat, user_lon)
+#                 distances = zones_df.apply(lambda r: np.hypot(r["lat"] - user_lat, r["lon"] - user_lon), axis=1)
+#                 nearest_idx = distances.idxmin()
+#                 nearest_zone = zones_df.loc[nearest_idx]
+
+#                 # Update the selectbox to show nearest zone as start
+#                 st.session_state.start_loc = nearest_zone["name"]
+#                 st.success(f"📍 Start set to nearest zone: {nearest_zone['name']} (GPS: {user_lat:.4f}, {user_lon:.4f})")
+
+#                 # Clear previous route results so user can recompute
+#                 st.session_state.route_result = None
+#                 st.session_state.is_navigating = False
+#                 st.rerun()
+#             else:
+#                 st.warning("⚠️ Unable to access your location. Please allow location permission in your browser and retry.")
+
+#     # Route mode
+#     route_mode = st.radio("Select Route Mode", ["Safest Route", "Shortest Route", "Show Both"], horizontal=True, index=0)
+
+#     # FIND ROUTE button — uses existing logic, but will prefer user_start_coords if present
+#     if st.button("🗺️ Find Route", type="primary", use_container_width=True):
+#         if start_name == end_name:
+#             st.error("Start and End locations must be different.")
+#         else:
+#             with st.spinner("Calculating routes..."):
+#                 # Determine start id either from user's GPS or selected start
+#                 start_coords = st.session_state.get("user_start_coords", None)
+#                 if start_coords:
+#                     # find nearest zone id to user's GPS
+#                     distances = zones_df.apply(lambda r: np.hypot(r["lat"] - start_coords[0], r["lon"] - start_coords[1]), axis=1)
+#                     start_id = zones_df.loc[distances.idxmin()]["id"]
+#                 else:
+#                     start_id = next(id for id, name in zone_names.items() if name == start_name)
+
+#                 end_id = next(id for id, name in zone_names.items() if name == end_name)
+
+#                 # SAFEST route
+#                 safe_waypoints, safe_aqi, safe_temp = find_optimal_route(start_id, end_id, zones_df, "safest")
+#                 safe_path_coords = get_road_path(
+#                     ors_client,
+#                     [(zones_df.loc[zones_df["id"] == w, "lat"].iloc[0], zones_df.loc[zones_df["id"] == w, "lon"].iloc[0]) for w in safe_waypoints]
+#                 ) if safe_waypoints else []
+
+#                 # SHORTEST route
+#                 if start_coords:
+#                     short_path_coords = get_road_path(ors_client, [
+#                         start_coords,
+#                         (zones_df.loc[zones_df["id"] == end_id, "lat"].iloc[0], zones_df.loc[zones_df["id"] == end_id, "lon"].iloc[0])
+#                     ])
+#                 else:
+#                     short_path_coords = get_road_path(ors_client, [
+#                         (zones_df.loc[zones_df["id"] == start_id, "lat"].iloc[0], zones_df.loc[zones_df["id"] == start_id, "lon"].iloc[0]),
+#                         (zones_df.loc[zones_df["id"] == end_id, "lat"].iloc[0], zones_df.loc[zones_df["id"] == end_id, "lon"].iloc[0])
+#                     ])
+
+#                 short_zones = zones_df[zones_df["id"].isin([start_id, end_id])]
+#                 short_aqi = short_zones["aqi"].mean()
+#                 short_temp = short_zones["temperature"].mean()
+
+#                 # Save route result in session
+#                 st.session_state.route_result = {
+#                     "mode": route_mode,
+#                     "safe_path_coords": safe_path_coords,
+#                     "safe_aqi": safe_aqi,
+#                     "safe_temp": safe_temp,
+#                     "short_path_coords": short_path_coords,
+#                     "short_aqi": short_aqi,
+#                     "short_temp": short_temp,
+#                     "start_coords": start_coords if start_coords else (
+#                         zones_df.loc[zones_df["id"] == start_id, "lat"].iloc[0],
+#                         zones_df.loc[zones_df["id"] == start_id, "lon"].iloc[0]
+#                     ),
+#                     "end_coords": (
+#                         zones_df.loc[zones_df["id"] == end_id, "lat"].iloc[0],
+#                         zones_df.loc[zones_df["id"] == end_id, "lon"].iloc[0]
+#                     ),
+#                     "start_name": start_name,
+#                     "end_name": end_name
+#                 }
+#                 st.session_state.is_navigating = False
+#                 st.rerun()
+
+#     # MAP DISPLAY (route preview)
+#     if st.session_state.get("route_result"):
+#         res = st.session_state.route_result
+#         preview_map = folium.Map(location=res["start_coords"], zoom_start=13)
+
+#         if res["mode"] in ["Safest Route", "Show Both"] and res.get("safe_path_coords"):
+#             folium.PolyLine(res["safe_path_coords"], color="green", weight=7, opacity=0.8, tooltip="Safest Route").add_to(preview_map)
+#         if res["mode"] in ["Shortest Route", "Show Both"] and res.get("short_path_coords"):
+#             folium.PolyLine(res["short_path_coords"], color="blue", weight=4, opacity=0.7, dash_array="5,5", tooltip="Shortest Route").add_to(preview_map)
+
+#         folium.Marker(res["start_coords"], popup=f"START: {res['start_name']}", icon=folium.Icon(color="green", icon="play")).add_to(preview_map)
+#         folium.Marker(res["end_coords"], popup=f"END: {res['end_name']}", icon=folium.Icon(color="red", icon="flag")).add_to(preview_map)
+
+#         st_folium(preview_map, height=500, width=900, returned_objects=[])
+
+#         # route metrics
+#         st.divider()
+#         colA, colB = st.columns(2)
+#         if res["mode"] in ["Safest Route", "Show Both"]:
+#             with colA:
+#                 st.markdown("### 🏆 Safest Route (Recommended)")
+#                 st.metric("Avg AQI / Temp", f"{res['safe_aqi']:.1f} / {res['safe_temp']:.1f}°C")
+#         if res["mode"] in ["Shortest Route", "Show Both"]:
+#             with colB:
+#                 st.markdown("### 📏 Shortest Route")
+#                 st.metric("Avg AQI / Temp", f"{res['short_aqi']:.1f} / {res['short_temp']:.1f}°C")
+
+#         # NAVIGATION: Start/Stop and live tracking
+#         st.markdown("### 🧭 Start Navigation (Embedded, live tracking)")
+#         nav_col1, nav_col2 = st.columns([1, 1])
+#         with nav_col1:
+#             if not st.session_state.get("is_navigating", False):
+#                 if st.button("▶ Start Navigation", use_container_width=True):
+#                     # enable navigation mode
+#                     st.session_state.is_navigating = True
+#                     # ensure we have a fresh user location if permission exists
+#                     fresh_loc = streamlit_geolocation()
+#                     if fresh_loc and fresh_loc.get("latitude") and fresh_loc.get("longitude"):
+#                         st.session_state.user_location = {"latitude": fresh_loc["latitude"], "longitude": fresh_loc["longitude"]}
+#                     st.rerun()
+#             else:
+#                 if st.button("⏹ Stop Navigation", use_container_width=True):
+#                     st.session_state.is_navigating = False
+#                     st.session_state.user_location = None
+#                     st.rerun()
+
+#         with nav_col2:
+#             st.checkbox("Enable live tracking (auto-update every 3s)", value=True, key="live_tracking_enabled")
+
+#         # If navigation is active, show the navigation map and update user position periodically
+#         if st.session_state.get("is_navigating", False):
+#             # Auto-refresh the page every 3000 ms to poll for a fresh location (only when live tracking enabled)
+#             if st.session_state.get("live_tracking_enabled", True):
+#                 st_autorefresh(interval=3000, key="nav_autorefresh")
+
+#             # Try to get the most recent location (will cause the browser permission popup if not yet allowed)
+#             current = streamlit_geolocation()
+#             if current and current.get("latitude") and current.get("longitude"):
+#                 st.session_state.user_location = {"latitude": current["latitude"], "longitude": current["longitude"]}
+
+#             # Build navigation map centered on current user location if present else start_coords
+#             nav_center = (st.session_state.user_location["latitude"], st.session_state.user_location["longitude"]) if st.session_state.get("user_location") else res["start_coords"]
+#             nav_map = folium.Map(location=nav_center, zoom_start=15)
+
+#             # Draw route using OpenRouteService geojson (prefer safe/short route depending on mode)
+#             try:
+#                 ors_client_local = ors_client  # already initialized at top-level of app
+#                 # ORS wants coords in (lon, lat)
+#                 coords_for_ors = [
+#                     (res["start_coords"][1], res["start_coords"][0]),
+#                     (res["end_coords"][1], res["end_coords"][0])
+#                 ]
+#                 route_geo = ors_client_local.directions(coordinates=coords_for_ors, profile='driving-car', format='geojson')
+#                 folium.GeoJson(route_geo, name="Route").add_to(nav_map)
+#             except Exception as e:
+#                 # fallback: plot the polylines we computed earlier
+#                 if res.get("safe_path_coords"):
+#                     folium.PolyLine(res["safe_path_coords"], color="green", weight=6, opacity=0.8).add_to(nav_map)
+#                 if res.get("short_path_coords"):
+#                     folium.PolyLine(res["short_path_coords"], color="blue", weight=4, opacity=0.7, dash_array="5,5").add_to(nav_map)
+
+#             # Add start and end markers
+#             folium.Marker(res["start_coords"], popup="Start", icon=folium.Icon(color="green")).add_to(nav_map)
+#             folium.Marker(res["end_coords"], popup="Destination", icon=folium.Icon(color="red")).add_to(nav_map)
+
+#             # Add a moving "you are here" marker if we have a user location
+#             if st.session_state.get("user_location"):
+#                 u = st.session_state["user_location"]
+#                 folium.CircleMarker(location=[u["latitude"], u["longitude"]], radius=7, color="blue",
+#                                     fill=True, fill_color="blue", popup="You (live)").add_to(nav_map)
+#                 # optionally add a small accuracy circle
+#                 folium.Circle(location=[u["latitude"], u["longitude"]], radius=15, color="blue", fill=False, opacity=0.3).add_to(nav_map)
+
+#             # Show the navigation map
+#             st_folium(nav_map, height=560, width=920)
+
+#             st.info("Live navigation active — map auto-refreshes while 'live tracking' is enabled. Click ⏹ Stop Navigation to end.")
+
+
+
+
+
+# ---- TAB 3: Intelligent Route Planner (Google-Maps-like navigation) ----
+from streamlit_geolocation import streamlit_geolocation
+from streamlit_folium import st_folium
+import folium
+import openrouteservice
+from streamlit_autorefresh import st_autorefresh  # pip install streamlit-autorefresh
+import time
+
 with tab3:
     st.header("🧭 Intelligent Route Planner")
-    st.markdown("Find the safest (lowest pollution & heat) or the shortest route with **real road navigation** and live updates.")
+    st.markdown("Find the safest (lowest pollution & heat) or the shortest route with **real road navigation** and live updates (route refreshes every 60s during navigation).")
 
     zones_df = st.session_state.zones
     zone_names = zones_df.set_index('id')['name'].to_dict()
 
-    # -------------------------------
-    #  UI LAYOUT: Start / End / Use My Location
-    # -------------------------------
+    # --- UI: Start / End / Use My Location ---
     col1, col2, col3 = st.columns([2, 2, 1])
     with col1:
-        default_start = st.session_state.get('start_loc', list(zone_names.values())[0])
-        start_name = st.selectbox(
-            "Select Start Location",
-            options=list(zone_names.values()),
-            index=list(zone_names.values()).index(default_start) if default_start in zone_names.values() else 0,
-            key="start_loc"
-        )
+        # Ensure "📍 My Current Location" is the first option so we can set it easily
+        start_options = ["📍 My Current Location"] + list(zone_names.values())
+        # determine index to show (fall back to first zone)
+        current_start = st.session_state.get("start_loc", list(zone_names.values())[0])
+        if current_start not in start_options:
+            current_start = list(zone_names.values())[0]
+        start_idx = start_options.index(current_start)
+        start_name = st.selectbox("Select Start Location", options=start_options, index=start_idx, key="start_loc")
     with col2:
-        end_name = st.selectbox(
-            "Select End Location",
-            options=list(zone_names.values()),
-            index=len(zone_names) - 1,
-            key="end_loc"
-        )
-
+        end_name = st.selectbox("Select End Location", options=list(zone_names.values()), index=len(zone_names)-1, key="end_loc")
     with col3:
-        st.write("")  # spacing
+        st.write("")  # spacer
         if st.button("📍 Use My Location", use_container_width=True):
-            location = streamlit_geolocation()
-            if location and location.get('latitude') and location.get('longitude'):
-                user_lat, user_lon = location['latitude'], location['longitude']
-
-                # Find nearest zone to current GPS location
-                distances = zones_df.apply(
-                    lambda r: np.hypot(r["lat"] - user_lat, r["lon"] - user_lon), axis=1
-                )
-                nearest_idx = distances.idxmin()
-                nearest_zone = zones_df.loc[nearest_idx]
-
-                st.session_state.start_loc = nearest_zone["name"]
+            loc = streamlit_geolocation()
+            if loc and loc.get("latitude") and loc.get("longitude"):
+                user_lat, user_lon = loc["latitude"], loc["longitude"]
+                # store the raw GPS coords
                 st.session_state.user_start_coords = (user_lat, user_lon)
-                st.success(f"📍 Start set to nearest zone: {st.session_state.start_loc} (GPS: {user_lat:.4f}, {user_lon:.4f})")
+                # set the dropdown label to the special label so it is obvious
+                st.session_state.start_loc = "📍 My Current Location"
+                st.success(f"✅ Using your current location as start: ({user_lat:.4f}, {user_lon:.4f})")
+                # clear any previous route and navigation state
                 st.session_state.route_result = None
+                st.session_state.is_navigating = False
+                st.session_state.user_location = {"latitude": user_lat, "longitude": user_lon}
                 st.rerun()
             else:
-                st.warning("⚠️ Please allow location access in your browser to use this feature.")
+                st.warning("⚠️ Unable to access location. Please allow location permission in your browser (and ensure app is served on localhost or HTTPS).")
 
-    # -------------------------------
-    #  ROUTE MODE TOGGLE
-    # -------------------------------
-    route_mode = st.radio(
-        "Select Route Mode",
-        ["Safest Route", "Shortest Route", "Show Both"],
-        horizontal=True,
-        index=0
-    )
+    # --- Route mode toggle ---
+    route_mode = st.radio("Select Route Mode", ["Safest Route", "Shortest Route", "Show Both"], horizontal=True, index=0)
 
-    # -------------------------------
-    #  BUTTON: FIND ROUTE
-    # -------------------------------
+    # --- Find Route button ---
     if st.button("🗺️ Find Route", type="primary", use_container_width=True):
         if start_name == end_name:
             st.error("Start and End locations must be different.")
         else:
             with st.spinner("Calculating routes..."):
-                start_coords = st.session_state.get("user_start_coords", None)
-                if start_coords:
-                    user_lat, user_lon = start_coords
+                # If user picked "My Current Location" use stored coords; else use selected zone
+                user_coords = st.session_state.get("user_start_coords", None)
+                if start_name == "📍 My Current Location" and user_coords:
+                    # determine nearest zone id to user's coords (for graph-based routing)
+                    user_lat, user_lon = user_coords
                     distances = zones_df.apply(lambda r: np.hypot(r["lat"] - user_lat, r["lon"] - user_lon), axis=1)
                     start_id = zones_df.loc[distances.idxmin()]["id"]
+                    start_coords_for_route = user_coords
                 else:
+                    start_coords_for_route = None
                     start_id = next(id for id, name in zone_names.items() if name == start_name)
 
                 end_id = next(id for id, name in zone_names.items() if name == end_name)
 
-                # SAFEST ROUTE
+                # SAFEST ROUTE (graph-based) -> translate to road coordinates via get_road_path if waypoints exist
                 safe_waypoints, safe_aqi, safe_temp = find_optimal_route(start_id, end_id, zones_df, "safest")
                 safe_path_coords = get_road_path(
                     ors_client,
-                    [(zones_df.loc[zones_df["id"] == w, "lat"].iloc[0],
-                      zones_df.loc[zones_df["id"] == w, "lon"].iloc[0]) for w in safe_waypoints]
+                    [(zones_df.loc[zones_df["id"] == w, "lat"].iloc[0], zones_df.loc[zones_df["id"] == w, "lon"].iloc[0]) for w in safe_waypoints]
                 ) if safe_waypoints else []
 
-                # SHORTEST ROUTE
-                if start_coords:
+                # SHORTEST ROUTE (direct)
+                if start_coords_for_route:
                     short_path_coords = get_road_path(ors_client, [
-                        start_coords,
-                        (zones_df.loc[zones_df["id"] == end_id, "lat"].iloc[0],
-                         zones_df.loc[zones_df["id"] == end_id, "lon"].iloc[0])
+                        start_coords_for_route,
+                        (zones_df.loc[zones_df["id"] == end_id, "lat"].iloc[0], zones_df.loc[zones_df["id"] == end_id, "lon"].iloc[0])
                     ])
                 else:
                     short_path_coords = get_road_path(ors_client, [
-                        (zones_df.loc[zones_df["id"] == start_id, "lat"].iloc[0],
-                         zones_df.loc[zones_df["id"] == start_id, "lon"].iloc[0]),
-                        (zones_df.loc[zones_df["id"] == end_id, "lat"].iloc[0],
-                         zones_df.loc[zones_df["id"] == end_id, "lon"].iloc[0])
+                        (zones_df.loc[zones_df["id"] == start_id, "lat"].iloc[0], zones_df.loc[zones_df["id"] == start_id, "lon"].iloc[0]),
+                        (zones_df.loc[zones_df["id"] == end_id, "lat"].iloc[0], zones_df.loc[zones_df["id"] == end_id, "lon"].iloc[0])
                     ])
 
                 short_zones = zones_df[zones_df["id"].isin([start_id, end_id])]
                 short_aqi = short_zones["aqi"].mean()
                 short_temp = short_zones["temperature"].mean()
 
+                # Save route result (we store start_coords as actual lat/lon if available)
                 st.session_state.route_result = {
                     "mode": route_mode,
                     "safe_path_coords": safe_path_coords,
@@ -1226,7 +1604,7 @@ with tab3:
                     "short_path_coords": short_path_coords,
                     "short_aqi": short_aqi,
                     "short_temp": short_temp,
-                    "start_coords": start_coords if start_coords else (
+                    "start_coords": start_coords_for_route if start_coords_for_route else (
                         zones_df.loc[zones_df["id"] == start_id, "lat"].iloc[0],
                         zones_df.loc[zones_df["id"] == start_id, "lon"].iloc[0]
                     ),
@@ -1238,35 +1616,115 @@ with tab3:
                     "end_name": end_name
                 }
                 st.session_state.is_navigating = False
+                # record last update time for 60s checks
+                st.session_state.last_nav_update = time.time()
                 st.rerun()
 
-    # -------------------------------
-    #  MAP DISPLAY
-    # -------------------------------
+    # --- Route preview map + metrics ---
     if st.session_state.get("route_result"):
         res = st.session_state.route_result
-        m = folium.Map(location=res["start_coords"], zoom_start=13)
+        preview_map = folium.Map(location=res["start_coords"], zoom_start=13)
 
+        # draw routes
         if res["mode"] in ["Safest Route", "Show Both"] and res.get("safe_path_coords"):
-            folium.PolyLine(res["safe_path_coords"], color="green", weight=7, opacity=0.8, tooltip="Safest Route").add_to(m)
+            folium.PolyLine(res["safe_path_coords"], color="green", weight=7, opacity=0.8, tooltip="Safest Route").add_to(preview_map)
         if res["mode"] in ["Shortest Route", "Show Both"] and res.get("short_path_coords"):
-            folium.PolyLine(res["short_path_coords"], color="blue", weight=4, opacity=0.7, dash_array="5,5", tooltip="Shortest Route").add_to(m)
+            folium.PolyLine(res["short_path_coords"], color="blue", weight=4, opacity=0.7, dash_array="5,5", tooltip="Shortest Route").add_to(preview_map)
 
-        folium.Marker(res["start_coords"], popup=f"START: {res['start_name']}", icon=folium.Icon(color="green", icon="play")).add_to(m)
-        folium.Marker(res["end_coords"], popup=f"END: {res['end_name']}", icon=folium.Icon(color="red", icon="flag")).add_to(m)
+        # start/end markers
+        folium.Marker(res["start_coords"], popup=f"START: {res['start_name']}", icon=folium.Icon(color="green", icon="play")).add_to(preview_map)
+        folium.Marker(res["end_coords"], popup=f"END: {res['end_name']}", icon=folium.Icon(color="red", icon="flag")).add_to(preview_map)
 
-        st_folium(m, height=500, width=900, returned_objects=[])
+        st_folium(preview_map, height=480, width=920, returned_objects=[])
 
         st.divider()
-        col1, col2 = st.columns(2)
+        c1, c2 = st.columns(2)
         if res["mode"] in ["Safest Route", "Show Both"]:
-            with col1:
+            with c1:
                 st.markdown("### 🏆 Safest Route (Recommended)")
                 st.metric("Avg AQI / Temp", f"{res['safe_aqi']:.1f} / {res['safe_temp']:.1f}°C")
         if res["mode"] in ["Shortest Route", "Show Both"]:
-            with col2:
+            with c2:
                 st.markdown("### 📏 Shortest Route")
                 st.metric("Avg AQI / Temp", f"{res['short_aqi']:.1f} / {res['short_temp']:.1f}°C")
+
+        # --- Navigation control and live tracking ---
+        st.markdown("### 🧭 Navigation (embedded, live updates every 60s)")
+        nav_col1, nav_col2 = st.columns([1, 1])
+        with nav_col1:
+            if not st.session_state.get("is_navigating", False):
+                if st.button("▶ Start Navigation", use_container_width=True):
+                    # enter navigation mode
+                    st.session_state.is_navigating = True
+                    # try to refresh immediate user location
+                    fresh = streamlit_geolocation()
+                    if fresh and fresh.get("latitude") and fresh.get("longitude"):
+                        st.session_state.user_location = {"latitude": fresh["latitude"], "longitude": fresh["longitude"]}
+                        st.session_state.user_start_coords = (fresh["latitude"], fresh["longitude"])
+                    else:
+                        # if we don't get a fresh location, ensure we still have something in session
+                        st.session_state.user_location = st.session_state.get("user_location", None)
+                    st.session_state.last_nav_update = time.time()
+                    st.rerun()
+            else:
+                if st.button("⏹ Stop Navigation", use_container_width=True):
+                    st.session_state.is_navigating = False
+                    st.session_state.user_location = None
+                    st.rerun()
+
+        with nav_col2:
+            live_tracking = st.checkbox("Enable live tracking (every 60s)", value=True, key="nav_live_checkbox")
+
+        # If navigation active, perform live updates (every 60s)
+        if st.session_state.get("is_navigating", False):
+            # trigger periodic rerun every 60 seconds (only when enabled)
+            if live_tracking:
+                # this will cause the script to re-run every 60_000 ms
+                st_autorefresh(interval=60000, key="nav_refresh")
+
+            # re-acquire latest user location (each run) — will prompt permission if not allowed
+            latest = streamlit_geolocation()
+            if latest and latest.get("latitude") and latest.get("longitude"):
+                st.session_state.user_location = {"latitude": latest["latitude"], "longitude": latest["longitude"]}
+                st.session_state.user_start_coords = (latest["latitude"], latest["longitude"])
+
+            # build navigation map centered on user's latest location if available, else route start
+            center = (st.session_state["user_location"]["latitude"], st.session_state["user_location"]["longitude"]) if st.session_state.get("user_location") else res["start_coords"]
+            nav_map = folium.Map(location=center, zoom_start=15)
+
+            # compute fresh route from current position to destination using ORS
+            try:
+                # ORS expects (lon, lat)
+                if st.session_state.get("user_location"):
+                    start_lonlat = (st.session_state["user_location"]["longitude"], st.session_state["user_location"]["latitude"])
+                else:
+                    start_lonlat = (res["start_coords"][1], res["start_coords"][0])
+                end_lonlat = (res["end_coords"][1], res["end_coords"][0])
+
+                route_geo = ors_client.directions(coordinates=[start_lonlat, end_lonlat], profile='driving-car', format='geojson')
+                folium.GeoJson(route_geo, name="Route").add_to(nav_map)
+            except Exception as e:
+                # fallback to previously computed polylines
+                if res.get("safe_path_coords"):
+                    folium.PolyLine(res["safe_path_coords"], color="green", weight=6, opacity=0.8).add_to(nav_map)
+                if res.get("short_path_coords"):
+                    folium.PolyLine(res["short_path_coords"], color="blue", weight=4, opacity=0.7, dash_array="5,5").add_to(nav_map)
+
+            # add start / destination markers
+            folium.Marker([res["end_coords"][0], res["end_coords"][1]], popup="Destination", icon=folium.Icon(color="red")).add_to(nav_map)
+            # add moving user marker (blue)
+            if st.session_state.get("user_location"):
+                u = st.session_state["user_location"]
+                folium.CircleMarker(location=[u["latitude"], u["longitude"]], radius=7, color="blue", fill=True, fill_color="blue", popup="You (live)").add_to(nav_map)
+                folium.Circle(location=[u["latitude"], u["longitude"]], radius=12, color="blue", fill=False, opacity=0.2).add_to(nav_map)
+            else:
+                # show start point if no live user location
+                folium.Marker(res["start_coords"], popup="Start", icon=folium.Icon(color="green")).add_to(nav_map)
+
+            # show map
+            st_folium(nav_map, height=600, width=920)
+            st.success("Live navigation active — route updates every 60 seconds. Click ⏹ Stop Navigation to end.")
+
 
 
 
